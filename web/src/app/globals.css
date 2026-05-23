@@ -46,3 +46,90 @@ textarea {
   height: 0;
   width: 0;
 }
+
+@keyframes sim-action-ack {
+  0% {
+    box-shadow: 0 0 0 0 rgba(125, 211, 252, 0.55);
+    transform: scale(1);
+  }
+
+  45% {
+    box-shadow: 0 0 0 8px rgba(125, 211, 252, 0);
+    transform: scale(1.035);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(125, 211, 252, 0);
+    transform: scale(1);
+  }
+}
+
+@keyframes sim-chip-travel {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 28px) scale(0.88);
+  }
+
+  18% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 1;
+    transform: translate(-50%, -132px) scale(1);
+  }
+}
+
+@keyframes sim-opponent-acting {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 1px 0 rgba(253, 230, 138, 0.14),
+      0 3px 10px rgba(0, 0, 0, 0.4),
+      0 0 0 0 rgba(253, 230, 138, 0.36);
+  }
+
+  50% {
+    box-shadow:
+      inset 0 1px 0 rgba(253, 230, 138, 0.18),
+      0 3px 10px rgba(0, 0, 0, 0.4),
+      0 0 0 7px rgba(253, 230, 138, 0);
+  }
+}
+
+@keyframes sim-review-reveal {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sim-action-ack {
+  animation: sim-action-ack 420ms ease-out;
+}
+
+.sim-chip-travel {
+  animation: sim-chip-travel 520ms cubic-bezier(0.2, 0.72, 0.2, 1) forwards;
+}
+
+.sim-opponent-acting {
+  animation: sim-opponent-acting 700ms ease-in-out;
+}
+
+.sim-review-reveal {
+  animation: sim-review-reveal 260ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sim-action-ack,
+  .sim-chip-travel,
+  .sim-opponent-acting,
+  .sim-review-reveal {
+    animation: none;
+  }
+}

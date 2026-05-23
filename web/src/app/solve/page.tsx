@@ -4,28 +4,11 @@ import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import type { ComboRow, SolveResults } from "@/lib/poker";
 
 interface SolveLog {
   time: string;
   message: string;
-}
-
-interface SolveResults {
-  actions: string;
-  currentBoard: number[];
-  history: number[];
-  isChance: boolean;
-  isTerminal: boolean;
-  numActions: number;
-  player: string;
-  possibleCards: number[];
-  privateCards: number[];
-  rootEqIp: number;
-  rootEqOop: number;
-  rootEvIp: number;
-  rootEvOop: number;
-  strategy: number[];
-  totalBetAmount: number[];
 }
 
 interface ProgressPoint {
@@ -37,15 +20,6 @@ interface MatrixCell {
   label: string;
   actionFreqs: number[];
   comboCount: number;
-}
-
-interface ComboRow {
-  cardA: string;
-  cardB: string;
-  cards: string;
-  freqs: number[];
-  handIndex: number;
-  label: string;
 }
 
 interface PathSegment {
@@ -543,15 +517,6 @@ function buildComboRow(results: SolveResults, hand: number, numHands: number): C
   };
 }
 
-function buildComboRows(results: SolveResults | null, limit = 12): ComboRow[] {
-  if (!results) return [];
-
-  const numHands = Math.floor(results.privateCards.length / 2);
-  return Array.from({ length: Math.min(numHands, limit) }, (_, hand) =>
-    buildComboRow(results, hand, numHands)
-  );
-}
-
 function buildComboRowsForLabel(results: SolveResults | null, label: string | null): ComboRow[] {
   if (!results || !label) return [];
 
@@ -992,7 +957,6 @@ export default function SolvePage() {
   const [nodeLockBrushPercents, setNodeLockBrushPercents] = useState<number[]>([0, 100]);
   const [nodeLockEnabled, setNodeLockEnabled] = useState(false);
   const [nodeLocksByHistory, setNodeLocksByHistory] = useState<Record<string, Record<number, number[]>>>({});
-  const [nodeLockLabel, setNodeLockLabel] = useState<string | null>(null);
   const nodeLockPaintingRef = useRef(false);
   const [nodeOpen, setNodeOpen] = useState(false);
   const [hoveredHandLabel, setHoveredHandLabel] = useState<string | null>(null);
@@ -1056,12 +1020,18 @@ export default function SolvePage() {
   const finalExploitability = progress?.exploitability ?? 0;
   const exploitabilityPct = startingPot > 0 ? (finalExploitability / startingPot) * 100 : 0;
   const currentNodeLockKey = historyKey(currentHistory);
-  const nodeLockHands = nodeLocksByHistory[currentNodeLockKey] ?? {};
+  const nodeLockHands = useMemo(
+    () => nodeLocksByHistory[currentNodeLockKey] ?? {},
+    [currentNodeLockKey, nodeLocksByHistory]
+  );
   const lockedHandCount = Object.keys(nodeLockHands).length;
   const pendingNodeLockStrategy = useMemo(() => {
     if (!results || !nodeLockEnabled || lockedHandCount === 0) return null;
     return buildPaintedNodeLock(results, nodeLockHands);
   }, [lockedHandCount, nodeLockEnabled, nodeLockHands, results]);
+  const nodeLockLabel = lockedHandCount > 0
+    ? `${lockedHandCount} combo${lockedHandCount === 1 ? "" : "s"} locked at this node`
+    : null;
   const presetActionConfig = useMemo(() => buildTreePresetActionConfig(treePreset), [treePreset]);
   const solverConfig = useMemo<SolverConfig>(() => ({
     oopRange,
@@ -1147,7 +1117,6 @@ export default function SolvePage() {
     setCurrentHistory([]);
     setPathSegments([]);
     setNodeLocksByHistory({});
-    setNodeLockLabel(null);
     setFixtureMode({ id: fixture.id, label: fixture.label, nodes });
     setDevFixturesOpen(false);
     setLogs([
@@ -1162,6 +1131,37 @@ export default function SolvePage() {
       },
     ]);
   }, [addLog]);
+
+  useEffect(() => {
+    if (!DEV_SOLVE_FIXTURES_ENABLED) return;
+
+    const fixtureId = new URLSearchParams(window.location.search).get("practiceFixture");
+    if (!fixtureId || fixtureMode?.id === fixtureId) return;
+
+    let cancelled = false;
+
+    loadDevSolveFixtures()
+      .then((fixtures) => {
+        if (cancelled) return;
+
+        const fixture = fixtures.find((item) => item.id === fixtureId);
+        if (!fixture) {
+          addLog(`ERROR: Practice fixture "${fixtureId}" was not found.`);
+          return;
+        }
+
+        loadDevFixture(fixture);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          addLog(`ERROR: Failed to load practice fixture: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [addLog, fixtureMode?.id, loadDevFixture]);
 
   const applySpotPreset = useCallback((
     nextGameType: GameType,
@@ -1348,7 +1348,6 @@ export default function SolvePage() {
     if (!activeLock) {
       setPathSegments([]);
       setNodeLocksByHistory({});
-      setNodeLockLabel(null);
     }
     setLogs([]);
 
@@ -1475,8 +1474,9 @@ export default function SolvePage() {
       const nextHands = typeof updater === "function" ? updater(current) : updater;
 
       if (Object.keys(nextHands).length === 0) {
-        const { [currentNodeLockKey]: _removed, ...rest } = prev;
-        return rest;
+        const next = { ...prev };
+        delete next[currentNodeLockKey];
+        return next;
       }
 
       return { ...prev, [currentNodeLockKey]: nextHands };
@@ -1485,10 +1485,10 @@ export default function SolvePage() {
 
   const clearNodeLock = useCallback(() => {
     setNodeLocksByHistory((prev) => {
-      const { [currentNodeLockKey]: _removed, ...rest } = prev;
-      return rest;
+      const next = { ...prev };
+      delete next[currentNodeLockKey];
+      return next;
     });
-    setNodeLockLabel(null);
   }, [currentNodeLockKey]);
 
   const unpaintHandClass = useCallback((label: string) => {
@@ -1551,15 +1551,6 @@ export default function SolvePage() {
     window.addEventListener("mouseup", stopPainting);
     return () => window.removeEventListener("mouseup", stopPainting);
   }, [nodeLockEnabled]);
-
-  useEffect(() => {
-    if (lockedHandCount === 0) {
-      setNodeLockLabel(null);
-      return;
-    }
-
-    setNodeLockLabel(`${lockedHandCount} combo${lockedHandCount === 1 ? "" : "s"} locked at this node`);
-  }, [lockedHandCount]);
 
   const beginPaintHandClass = useCallback((label: string, isPainted: boolean) => {
     if (!nodeLockEnabled) return;
