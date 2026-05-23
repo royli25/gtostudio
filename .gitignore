@@ -1,0 +1,18 @@
+.DS_Store
+**/.DS_Store
+
+# Build outputs and local dependencies
+**/target/
+**/node_modules/
+**/.npm-cache/
+**/.next/
+**/dist/
+**/build/
+*.tsbuildinfo
+
+# Local debug logs
+rustc-ice-*.txt
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*

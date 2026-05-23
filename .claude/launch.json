@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["-e", "process.chdir('/Users/royli/Desktop/PokerCS/PostFlopSolver/web'); require('child_process').execFileSync('npx', ['next', 'dev', '--port', '3000'], {stdio: 'inherit'})"],
+      "port": 3000
+    }
+  ]
+}
