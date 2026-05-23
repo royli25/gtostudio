@@ -581,8 +581,49 @@ function normalizedPercents(values: number[]): number[] {
   return clamped.map((value) => value / sum);
 }
 
-function oneHotStrategy(numActions: number, actionIndex: number): number[] {
-  return Array.from({ length: numActions }, (_, index) => (index === actionIndex ? 1 : 0));
+function oneHotPercents(numActions: number, actionIndex: number): number[] {
+  return Array.from({ length: numActions }, (_, index) => (index === actionIndex ? 100 : 0));
+}
+
+function setBrushActionPercent(percents: number[], actionIndex: number, nextValue: number): number[] {
+  const numActions = percents.length;
+  const clamped = Math.max(0, Math.min(100, Math.round(nextValue)));
+
+  if (numActions <= 1) return [100];
+
+  const otherIndices = Array.from({ length: numActions }, (_, index) => index).filter((index) => index !== actionIndex);
+  const othersSum = otherIndices.reduce((total, index) => total + percents[index], 0);
+  const remainder = 100 - clamped;
+  const next = [...percents];
+  next[actionIndex] = clamped;
+
+  if (othersSum <= 0) {
+    const share = Math.floor(remainder / otherIndices.length);
+    let leftover = remainder - share * otherIndices.length;
+    otherIndices.forEach((index) => {
+      next[index] = share + (leftover > 0 ? 1 : 0);
+      leftover -= leftover > 0 ? 1 : 0;
+    });
+    return next;
+  }
+
+  let assigned = 0;
+  otherIndices.forEach((index, position) => {
+    if (position === otherIndices.length - 1) {
+      next[index] = remainder - assigned;
+      return;
+    }
+
+    const value = Math.round((percents[index] / othersSum) * remainder);
+    next[index] = value;
+    assigned += value;
+  });
+
+  return next;
+}
+
+function brushStrategyFromPercents(percents: number[]): number[] {
+  return normalizedPercents(percents);
 }
 
 function buildPaintedNodeLock(
@@ -770,6 +811,97 @@ function ComingSoonPanel({
   );
 }
 
+function NodeLockMixBar({
+  actions,
+  percents,
+  selectedAction,
+  onPercentChange,
+}: {
+  actions: string[];
+  percents: number[];
+  selectedAction: number;
+  onPercentChange: (actionIndex: number, value: number) => void;
+}) {
+  const barRef = useRef<HTMLDivElement>(null);
+
+  const updateFromClientX = useCallback((clientX: number) => {
+    const bar = barRef.current;
+    if (!bar) return;
+
+    const rect = bar.getBoundingClientRect();
+    if (rect.width <= 0) return;
+
+    const pct = Math.round(((clientX - rect.left) / rect.width) * 100);
+    const clamped = Math.max(0, Math.min(100, pct));
+
+    if (actions.length === 2) {
+      onPercentChange(0, clamped);
+      return;
+    }
+
+    onPercentChange(selectedAction, clamped);
+  }, [actions.length, onPercentChange, selectedAction]);
+
+  const handlePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const bar = barRef.current;
+    if (!bar) return;
+
+    bar.setPointerCapture(event.pointerId);
+    updateFromClientX(event.clientX);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      updateFromClientX(moveEvent.clientX);
+    };
+
+    const handlePointerUp = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== event.pointerId) return;
+      bar.releasePointerCapture(event.pointerId);
+      bar.removeEventListener("pointermove", handlePointerMove);
+      bar.removeEventListener("pointerup", handlePointerUp);
+    };
+
+    bar.addEventListener("pointermove", handlePointerMove);
+    bar.addEventListener("pointerup", handlePointerUp);
+  }, [updateFromClientX]);
+
+  const splitPct = actions.length === 2 ? (percents[0] ?? 0) : (percents[selectedAction] ?? 0);
+
+  return (
+    <div
+      ref={barRef}
+      aria-label="Strategy mix"
+      aria-valuemax={100}
+      aria-valuemin={0}
+      aria-valuenow={splitPct}
+      className="relative h-3 cursor-ew-resize touch-none select-none overflow-visible rounded-full bg-[#25262a] py-2"
+      onPointerDown={handlePointerDown}
+      role="slider"
+      tabIndex={0}
+    >
+      <div className="absolute inset-x-0 top-1/2 flex h-3 -translate-y-1/2 overflow-hidden rounded-full">
+        {actions.map((action, index) => {
+          const pct = percents[index] ?? 0;
+          if (pct <= 0) return null;
+
+          return (
+            <div
+              key={action}
+              className="h-full shrink-0"
+              style={{ background: colorForAction(index, action), width: `${pct}%` }}
+            />
+          );
+        })}
+      </div>
+      <div
+        className="pointer-events-none absolute top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-md ring-1 ring-black/25"
+        style={{ left: `${splitPct}%` }}
+      />
+    </div>
+  );
+}
+
 function historyKey(history: number[]): string {
   return history.join("/");
 }
@@ -861,6 +993,7 @@ export default function SolvePage() {
   const [spotPresetOpen, setSpotPresetOpen] = useState(false);
   const [solveSettingsOpen, setSolveSettingsOpen] = useState(false);
   const [nodeLockBrushAction, setNodeLockBrushAction] = useState(1);
+  const [nodeLockBrushPercents, setNodeLockBrushPercents] = useState<number[]>([0, 100]);
   const [nodeLockEnabled, setNodeLockEnabled] = useState(false);
   const [nodeLocksByHistory, setNodeLocksByHistory] = useState<Record<string, Record<number, number[]>>>({});
   const [nodeLockLabel, setNodeLockLabel] = useState<string | null>(null);
@@ -1360,10 +1493,32 @@ export default function SolvePage() {
     });
   }, [results, updateNodeLockHands]);
 
+  const setNodeLockBrushPercent = useCallback((actionIndex: number, nextValue: number) => {
+    setNodeLockBrushPercents((prev) => {
+      const numActions = results?.numActions ?? prev.length;
+      const base = prev.length === numActions
+        ? prev
+        : oneHotPercents(numActions, Math.min(nodeLockBrushAction, numActions - 1));
+      return setBrushActionPercent(base, actionIndex, nextValue);
+    });
+  }, [nodeLockBrushAction, results?.numActions]);
+
+  const resetNodeLockBrush = useCallback((numActions: number, actionIndex: number) => {
+    const safeIndex = Math.max(0, Math.min(actionIndex, numActions - 1));
+    setNodeLockBrushAction(safeIndex);
+    setNodeLockBrushPercents(oneHotPercents(numActions, safeIndex));
+  }, []);
+
+  const effectiveNodeLockBrushPercents = useMemo(() => {
+    if (!results || results.isChance || results.isTerminal) return nodeLockBrushPercents;
+    if (nodeLockBrushPercents.length === results.numActions) return nodeLockBrushPercents;
+    return oneHotPercents(results.numActions, Math.min(nodeLockBrushAction, results.numActions - 1));
+  }, [nodeLockBrushAction, nodeLockBrushPercents, results]);
+
   const paintHandClass = useCallback((label: string) => {
     if (!results || !nodeLockEnabled) return;
 
-    const actionStrategy = oneHotStrategy(results.numActions, nodeLockBrushAction);
+    const actionStrategy = brushStrategyFromPercents(effectiveNodeLockBrushPercents);
     const indices = handClassIndices(results, label);
 
     updateNodeLockHands((current) => {
@@ -1373,7 +1528,7 @@ export default function SolvePage() {
       });
       return next;
     });
-  }, [nodeLockBrushAction, nodeLockEnabled, results, updateNodeLockHands]);
+  }, [effectiveNodeLockBrushPercents, nodeLockEnabled, results, updateNodeLockHands]);
 
   useEffect(() => {
     if (!nodeLockEnabled) return;
@@ -1991,7 +2146,7 @@ export default function SolvePage() {
                       setCenterView("strategy");
                       setRightLockTab("strategy");
                       if (results) {
-                        setNodeLockBrushAction(results.numActions > 1 ? 1 : 0);
+                        resetNodeLockBrush(results.numActions, results.numActions > 1 ? 1 : 0);
                       }
                     }
                   }}
@@ -2153,58 +2308,79 @@ export default function SolvePage() {
                   <div className="space-y-3">
                     <div className="grid grid-cols-2 gap-2">
                       {actions.map((action, index) => {
-                        const selected = index === nodeLockBrushAction;
                         const actionColor = colorForAction(index, action);
-                        const brushPct = selected ? 100 : 0;
-
-                        return (
-                          <button
-                            className={classNames(
-                              "overflow-hidden rounded-lg text-left text-white transition-[transform,box-shadow] duration-150",
-                              selected ? "ring-2 ring-white/90 ring-offset-2 ring-offset-[#1d1e21]" : "opacity-90 hover:opacity-100"
-                            )}
-                            key={action}
-                            onClick={() => setNodeLockBrushAction(index)}
-                            style={{ background: actionColor }}
-                            type="button"
-                          >
-                            <div className="p-3 pb-2">
-                              <div className="text-sm font-semibold leading-tight">{formatAction(action)}</div>
-                              <div className="mt-2 inline-flex min-w-[3rem] items-center justify-center rounded bg-black/25 px-2 py-1 text-2xl font-semibold tabular-nums">
-                                {brushPct}
-                              </div>
-                            </div>
-                            <div className="grid grid-cols-5 border-t border-black/20 bg-black/15">
-                              {[0, 25, 50, 75, 100].map((pct) => (
-                                <span
-                                  className={classNames(
-                                    "py-1.5 text-center text-[11px] font-medium",
-                                    pct === brushPct && selected ? "bg-black/25 text-white" : "text-white/70"
-                                  )}
-                                  key={pct}
-                                >
-                                  {pct}
-                                </span>
-                              ))}
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    <div className="flex h-1.5 overflow-hidden rounded-full bg-[#25262a]">
-                      {actions.map((action, index) => {
-                        const total = actionTotals[index] ?? 0;
-                        if (total <= 0) return null;
+                        const brushPct = effectiveNodeLockBrushPercents[index] ?? 0;
 
                         return (
                           <div
+                            className="overflow-hidden rounded-lg text-left text-white opacity-90 transition-[transform,opacity] duration-150 hover:opacity-100"
                             key={action}
-                            style={{ background: colorForAction(index, action), width: `${total * 100}%` }}
-                          />
+                            style={{ background: actionColor }}
+                          >
+                            <div className="p-3 pb-2">
+                              <div className="text-sm font-semibold leading-tight">{formatAction(action)}</div>
+                            </div>
+
+                            <div className="flex items-center justify-center gap-2 px-3 pb-2">
+                              <button
+                                aria-label={`Decrease ${formatAction(action)} frequency`}
+                                className="flex h-7 w-7 items-center justify-center rounded bg-black/20 text-lg leading-none text-white/90 hover:bg-black/30"
+                                onClick={() => setNodeLockBrushPercent(index, brushPct - 1)}
+                                type="button"
+                              >
+                                −
+                              </button>
+                              <input
+                                aria-label={`${formatAction(action)} frequency`}
+                                className="w-16 rounded bg-white px-2 py-1 text-center text-lg font-semibold tabular-nums text-zinc-900 outline-none"
+                                inputMode="numeric"
+                                max={100}
+                                min={0}
+                                onChange={(event) => {
+                                  const parsed = Number.parseInt(event.target.value, 10);
+                                  if (Number.isFinite(parsed)) {
+                                    setNodeLockBrushPercent(index, parsed);
+                                  }
+                                }}
+                                type="number"
+                                value={brushPct}
+                              />
+                              <button
+                                aria-label={`Increase ${formatAction(action)} frequency`}
+                                className="flex h-7 w-7 items-center justify-center rounded bg-black/20 text-lg leading-none text-white/90 hover:bg-black/30"
+                                onClick={() => setNodeLockBrushPercent(index, brushPct + 1)}
+                                type="button"
+                              >
+                                +
+                              </button>
+                            </div>
+
+                            <div className="grid grid-cols-5 border-t border-black/20 bg-black/15">
+                              {[0, 25, 50, 75, 100].map((pct) => (
+                                <button
+                                  className={classNames(
+                                    "py-1.5 text-center text-[11px] font-medium transition-colors",
+                                    pct === brushPct ? "bg-black/25 text-white" : "text-white/70 hover:bg-black/10 hover:text-white"
+                                  )}
+                                  key={pct}
+                                  onClick={() => setNodeLockBrushPercent(index, pct)}
+                                  type="button"
+                                >
+                                  {pct}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
                         );
                       })}
                     </div>
+
+                    <NodeLockMixBar
+                      actions={actions}
+                      onPercentChange={setNodeLockBrushPercent}
+                      percents={effectiveNodeLockBrushPercents}
+                      selectedAction={nodeLockBrushAction}
+                    />
 
                     <div className="flex items-center justify-between text-xs text-zinc-500">
                       <span>
