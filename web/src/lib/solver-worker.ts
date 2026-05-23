@@ -2,6 +2,14 @@ import init, { GameManager } from "./solver_wasm";
 
 let game: GameManager | null = null;
 
+const MB = 1024 * 1024;
+const AUTO_COMPRESSION_THRESHOLD_MB = 3072;
+const MAX_WASM_MEMORY_MB = 3900;
+
+function formatMemory(bytes: number): string {
+  return `${(bytes / MB).toFixed(0)} MB`;
+}
+
 type WorkerMessage =
   | { type: "init"; config: SolverConfig }
   | { type: "lock_current_node"; history?: number[]; strategy: number[] }
@@ -68,17 +76,34 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         c.mergingThreshold
       );
       const memoryUsage = Number(game.memory_usage(false)[0]);
+      const memoryUsageCompressed = Number(game.memory_usage(true)[0]);
+      const enableCompression = memoryUsage / MB > AUTO_COMPRESSION_THRESHOLD_MB;
+      const selectedMemoryUsage = enableCompression ? memoryUsageCompressed : memoryUsage;
 
       self.postMessage({
         type: "log",
-        message: `Memory estimate: ${(memoryUsage / 1024 / 1024).toFixed(0)} MB`,
+        message: `Memory estimate: ${formatMemory(memoryUsage)} uncompressed, ${formatMemory(memoryUsageCompressed)} compressed`,
       });
+      if (enableCompression) {
+        self.postMessage({
+          type: "log",
+          message: `Using compressed storage because the uncompressed tree is larger than ${AUTO_COMPRESSION_THRESHOLD_MB} MB.`,
+        });
+      }
+      if (selectedMemoryUsage / MB > MAX_WASM_MEMORY_MB) {
+        throw new Error(
+          `Tree is too large for browser memory (${formatMemory(selectedMemoryUsage)} ${enableCompression ? "compressed" : "uncompressed"}). Disable some bet/raise sizes or use narrower ranges.`
+        );
+      }
       self.postMessage({
         type: "init_done",
-        memoryUsageMB: memoryUsage / (1024 * 1024),
+        memoryUsageMB: selectedMemoryUsage / MB,
+        memoryUsageUncompressedMB: memoryUsage / MB,
+        memoryUsageCompressedMB: memoryUsageCompressed / MB,
+        enableCompression,
       });
 
-      game.allocate_memory(false);
+      game.allocate_memory(enableCompression);
       self.postMessage({ type: "memory_allocated" });
     } catch (err) {
       self.postMessage({

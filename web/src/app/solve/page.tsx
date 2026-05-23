@@ -215,6 +215,28 @@ const ACTION_LABELS: Array<{ key: ActionSolverConfigKey; label: string; raise: b
   { key: "ipRiverRaise", label: "IP river raise", raise: true },
 ];
 
+type TreePreset = "simple" | "complex";
+
+const TREE_PRESETS: Record<TreePreset, {
+  label: string;
+  description: string;
+  bets: string;
+  raises: string;
+}> = {
+  simple: {
+    label: "Simple Solve",
+    description: "Fast solves with small and medium bets plus a standard 3x raise.",
+    bets: "33%, 75%",
+    raises: "3x",
+  },
+  complex: {
+    label: "Complex Solve",
+    description: "Full tree with overbets and all-in for closer GTO accuracy.",
+    bets: "33%, 75%, 150%, a",
+    raises: "2.5x, 3x",
+  },
+};
+
 const NUMERIC_LABELS: Array<{ key: NumericSolverConfigKey; label: string }> = [
   { key: "rakeRate", label: "Rake rate" },
   { key: "rakeCap", label: "Rake cap" },
@@ -223,74 +245,43 @@ const NUMERIC_LABELS: Array<{ key: NumericSolverConfigKey; label: string }> = [
   { key: "mergingThreshold", label: "Merging threshold" },
 ];
 
-function buildBaselineActionConfig(potType: PotType): Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey> {
-  const compact = {
-    oopFlopBet: "52%",
-    oopFlopRaise: "45%",
-    ipFlopBet: "52%",
-    ipFlopRaise: "45%",
-    oopTurnBet: "55%",
-    oopTurnRaise: "45%",
-    ipTurnBet: "55%",
-    ipTurnRaise: "45%",
-    oopRiverBet: "70%",
-    oopRiverRaise: "45%",
-    ipRiverBet: "70%",
-    ipRiverRaise: "45%",
+function buildTreePresetActionConfig(
+  preset: TreePreset
+): Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey> {
+  const { bets, raises } = TREE_PRESETS[preset];
+
+  return {
+    oopFlopBet: bets,
+    oopFlopRaise: raises,
+    ipFlopBet: bets,
+    ipFlopRaise: raises,
+    oopTurnBet: bets,
+    oopTurnRaise: raises,
+    ipTurnBet: bets,
+    ipTurnRaise: raises,
+    oopRiverBet: bets,
+    oopRiverRaise: raises,
+    ipRiverBet: bets,
+    ipRiverRaise: raises,
     rakeRate: 0,
     rakeCap: 0,
     addAllinThreshold: 0,
     forceAllinThreshold: 0,
     mergingThreshold: 0,
   };
-
-  if (potType === "Limped pot") {
-    return {
-      ...compact,
-      oopFlopBet: "33%, 66%",
-      oopFlopRaise: "45%",
-      ipFlopBet: "33%, 66%",
-      ipFlopRaise: "45%",
-      oopTurnBet: "50%, 75%",
-      oopTurnRaise: "45%",
-      ipTurnBet: "50%, 75%",
-      ipTurnRaise: "45%",
-      oopRiverBet: "66%, 100%",
-      oopRiverRaise: "45%",
-      ipRiverBet: "66%, 100%",
-      ipRiverRaise: "45%",
-    };
-  }
-
-  if (potType === "3-bet pot" || potType === "4-bet pot") {
-    return {
-      ...compact,
-      oopFlopBet: "33%",
-      oopFlopRaise: "45%",
-      ipFlopBet: "33%",
-      ipFlopRaise: "45%",
-      oopTurnBet: "66%",
-      oopTurnRaise: "45%",
-      ipTurnBet: "66%",
-      ipTurnRaise: "45%",
-      oopRiverBet: "75%",
-      oopRiverRaise: "45%",
-      ipRiverBet: "75%",
-      ipRiverRaise: "45%",
-    };
-  }
-
-  return compact;
 }
 
-function formatBetSummary(config: Pick<SolverConfig, ActionSolverConfigKey>, baseline: Pick<SolverConfig, ActionSolverConfigKey>): string {
-  const changed = ACTION_LABELS.filter(({ key }) => config[key] !== baseline[key]).length;
-
-  if (changed > 0) {
-    return `${changed} advanced override${changed === 1 ? "" : "s"}`;
+function treePresetFromActionConfig(
+  config: Pick<SolverConfig, ActionSolverConfigKey>
+): TreePreset | null {
+  for (const preset of Object.keys(TREE_PRESETS) as TreePreset[]) {
+    const presetConfig = buildTreePresetActionConfig(preset);
+    if (ACTION_LABELS.every(({ key }) => config[key] === presetConfig[key])) {
+      return preset;
+    }
   }
 
-  return "Beginner baseline";
+  return null;
 }
 
 function isValidBetToken(token: string, raise: boolean): boolean {
@@ -1009,7 +1000,7 @@ export default function SolvePage() {
   const [villainPosition, setVillainPosition] = useState("BTN");
   const [potType, setPotType] = useState<PotType>("Single raised pot");
   const initialPreset = buildPresetRanges("6-max", "UTG", "BTN", "Single raised pot");
-  const initialBaseline = buildBaselineActionConfig("Single raised pot");
+  const initialBaseline = buildTreePresetActionConfig("simple");
   const [oopRange, setOopRange] = useState(initialPreset.oopRange);
   const [ipRange, setIpRange] = useState(initialPreset.ipRange);
   const [boardSlots, setBoardSlots] = useState(["Qs", "Jh", "2h"]);
@@ -1021,6 +1012,7 @@ export default function SolvePage() {
   const [effectiveStack, setEffectiveStack] = useState(910);
   const [maxIterations, setMaxIterations] = useState(200);
   const [targetExpl, setTargetExpl] = useState(0.1);
+  const [treePreset, setTreePreset] = useState<TreePreset>("simple");
   const [actionConfig, setActionConfig] = useState<Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey>>(initialBaseline);
 
   const actions = useMemo(() => splitActions(results?.actions ?? "Check, Bet(94)"), [results]);
@@ -1065,7 +1057,7 @@ export default function SolvePage() {
     if (!results || !nodeLockEnabled || lockedHandCount === 0) return null;
     return buildPaintedNodeLock(results, nodeLockHands);
   }, [lockedHandCount, nodeLockEnabled, nodeLockHands, results]);
-  const baselineConfig = useMemo(() => buildBaselineActionConfig(potType), [potType]);
+  const presetActionConfig = useMemo(() => buildTreePresetActionConfig(treePreset), [treePreset]);
   const solverConfig = useMemo<SolverConfig>(() => ({
     oopRange,
     ipRange,
@@ -1075,16 +1067,30 @@ export default function SolvePage() {
     ...actionConfig,
   }), [actionConfig, board, boardCards.length, effectiveStack, ipRange, oopRange, startingPot]);
   const validationErrors = useMemo(() => validateSolveConfig(solverConfig, boardSlots), [boardSlots, solverConfig]);
-  const betSummary = useMemo(() => formatBetSummary(actionConfig, baselineConfig), [actionConfig, baselineConfig]);
+  const activeTreePreset = useMemo(() => treePresetFromActionConfig(actionConfig) ?? treePreset, [actionConfig, treePreset]);
+  const activePresetMeta = TREE_PRESETS[activeTreePreset];
+  const actionConfigMatchesPreset = ACTION_LABELS.every(({ key }) => actionConfig[key] === presetActionConfig[key]);
+  const numericConfigIsDefault = NUMERIC_LABELS.every(({ key }) => actionConfig[key] === presetActionConfig[key]);
+  const actionConfigIsDefault = actionConfigMatchesPreset && numericConfigIsDefault;
+  const treeSizeWarning = treePreset === "complex" || activeTreePreset === "complex";
   const currentNodeLabel = results?.isTerminal
     ? "Terminal"
     : results?.isChance
       ? "Chance"
       : `${actingSeat} to act`;
   const rangeIsBaseline = oopRange === presetRanges.oopRange && ipRange === presetRanges.ipRange;
-  const actionConfigIsBaseline = ACTION_LABELS.every(({ key }) => actionConfig[key] === baselineConfig[key])
-    && NUMERIC_LABELS.every(({ key }) => actionConfig[key] === baselineConfig[key]);
-  const treeSizeWarning = ACTION_LABELS.reduce((total, { key }) => total + actionConfig[key].split(",").filter(Boolean).length, 0) > 16;
+
+  const selectTreePreset = useCallback((preset: TreePreset) => {
+    setTreePreset(preset);
+    setActionConfig((current) => ({
+      ...buildTreePresetActionConfig(preset),
+      rakeRate: current.rakeRate,
+      rakeCap: current.rakeCap,
+      addAllinThreshold: current.addAllinThreshold,
+      forceAllinThreshold: current.forceAllinThreshold,
+      mergingThreshold: current.mergingThreshold,
+    }));
+  }, []);
 
   const addLog = useCallback((message: string) => {
     setLogs((prev) => [
@@ -1130,6 +1136,8 @@ export default function SolvePage() {
     setMaxIterations(fixture.maxIterations);
     setTargetExpl(fixture.targetExpl);
     setActionConfig(fixture.actionConfig);
+    const fixturePreset = treePresetFromActionConfig(fixture.actionConfig);
+    if (fixturePreset) setTreePreset(fixturePreset);
     setProgress(fixture.progress);
     setResults(root);
     setSolving(false);
@@ -1167,8 +1175,8 @@ export default function SolvePage() {
     setPotType(nextPotType);
     setOopRange(ranges.oopRange);
     setIpRange(ranges.ipRange);
-    setActionConfig(buildBaselineActionConfig(nextPotType));
-  }, []);
+    setActionConfig(buildTreePresetActionConfig(treePreset));
+  }, [treePreset]);
 
   const updateActionConfig = useCallback(<K extends ActionSolverConfigKey | NumericSolverConfigKey>(
     key: K,
@@ -1183,8 +1191,9 @@ export default function SolvePage() {
   const resetAdvancedToBaseline = useCallback(() => {
     setOopRange(presetRanges.oopRange);
     setIpRange(presetRanges.ipRange);
-    setActionConfig(baselineConfig);
-  }, [baselineConfig, presetRanges.ipRange, presetRanges.oopRange]);
+    setTreePreset("simple");
+    setActionConfig(buildTreePresetActionConfig("simple"));
+  }, [presetRanges.ipRange, presetRanges.oopRange]);
 
   const stopWorker = useCallback(() => {
     workerRef.current?.terminate();
@@ -1341,7 +1350,7 @@ export default function SolvePage() {
     }
     setLogs([]);
 
-    const worker = new Worker("/solver-worker.js?v=14", { type: "module" });
+    const worker = new Worker("/solver-worker.js?v=15", { type: "module" });
     workerRef.current = worker;
 
     worker.onmessage = (event) => {
@@ -1777,36 +1786,35 @@ export default function SolvePage() {
             </div>
 
             <div className="rounded border border-white/10 bg-[#1d1e21] p-3">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-semibold">Bet-size preset</h2>
-                <span className="text-xs text-zinc-500">{betSummary}</span>
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <h2 className="text-sm font-semibold">Bet sizing</h2>
+                {!actionConfigMatchesPreset && (
+                  <span className="rounded bg-amber-300/10 px-2 py-0.5 text-[11px] text-amber-100">Custom tree</span>
+                )}
               </div>
-              <div className="space-y-2 text-sm">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-zinc-500">Flop</span>
-                  <span className="text-right font-mono text-xs text-zinc-200">
-                    OOP {actionConfig.oopFlopBet} · IP {actionConfig.ipFlopBet}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-zinc-500">Turn</span>
-                  <span className="text-right font-mono text-xs text-zinc-200">
-                    OOP {actionConfig.oopTurnBet} · IP {actionConfig.ipTurnBet}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-zinc-500">River</span>
-                  <span className="text-right font-mono text-xs text-zinc-200">
-                    OOP {actionConfig.oopRiverBet} · IP {actionConfig.ipRiverBet}
-                  </span>
-                </div>
-                <button
-                  className="mt-1 w-full rounded bg-white/8 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-white/12"
-                  onClick={() => setAdvancedOpen(true)}
-                  type="button"
-                >
-                  Edit full tree in Advanced Settings
-                </button>
+              <div className="grid grid-cols-2 gap-2">
+                {(Object.keys(TREE_PRESETS) as TreePreset[]).map((preset) => {
+                  const active = treePreset === preset && actionConfigMatchesPreset;
+
+                  return (
+                    <button
+                      className={
+                        active
+                          ? "rounded border border-sky-300/60 bg-sky-300 px-3 py-2.5 text-left text-xs font-semibold text-black"
+                          : "rounded border border-white/10 bg-[#222326] px-3 py-2.5 text-left text-xs font-semibold text-zinc-200 hover:border-sky-300/50 hover:bg-[#22313a]"
+                      }
+                      key={preset}
+                      onClick={() => selectTreePreset(preset)}
+                      type="button"
+                    >
+                      {TREE_PRESETS[preset].label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-3 text-xs leading-relaxed text-zinc-500">{activePresetMeta.description}</p>
+              <div className="mt-2 rounded bg-black/20 px-3 py-2 font-mono text-[11px] text-zinc-400">
+                Bets {activePresetMeta.bets} · Raises {activePresetMeta.raises}
               </div>
             </div>
 
@@ -2817,33 +2825,41 @@ export default function SolvePage() {
             <section className="rounded border border-white/10 bg-[#202124] p-3">
               <div className="mb-3 flex items-start justify-between gap-3">
                 <div>
-                  <h3 className="text-sm font-semibold">Full action tree</h3>
+                  <h3 className="text-sm font-semibold">Action tree preset</h3>
                   <p className="mt-1 text-xs text-zinc-500">
-                    Comma-separate solver sizes. Raises also accept previous-bet-relative `x` sizes.
+                    Same bet and raise sizes for OOP and IP on flop, turn, and river.
                   </p>
                 </div>
-                <span className={actionConfigIsBaseline ? "rounded bg-emerald-300/10 px-2 py-1 text-xs text-emerald-200" : "rounded bg-amber-300/10 px-2 py-1 text-xs text-amber-100"}>
-                  {actionConfigIsBaseline ? "Baseline tree" : "Tree overrides"}
+                <span className={actionConfigIsDefault ? "rounded bg-emerald-300/10 px-2 py-1 text-xs text-emerald-200" : "rounded bg-amber-300/10 px-2 py-1 text-xs text-amber-100"}>
+                  {actionConfigIsDefault ? activePresetMeta.label : "Custom tree"}
                 </span>
               </div>
-              <div className="mb-3 rounded bg-black/20 p-2 text-xs text-zinc-500">
-                Grammar: `70%`, `2.5x` for raises, `100c`, `20c3r`, `e`, `2e`, `3e200%`, or `a`.
+              <div className="grid grid-cols-2 gap-2">
+                {(Object.keys(TREE_PRESETS) as TreePreset[]).map((preset) => {
+                  const active = treePreset === preset && actionConfigMatchesPreset;
+
+                  return (
+                    <button
+                      className={
+                        active
+                          ? "rounded border border-sky-300/60 bg-sky-300 px-3 py-3 text-left"
+                          : "rounded border border-white/10 bg-[#242528] px-3 py-3 text-left hover:border-sky-300/50 hover:bg-[#22313a]"
+                      }
+                      key={preset}
+                      onClick={() => selectTreePreset(preset)}
+                      type="button"
+                    >
+                      <div className={active ? "text-sm font-semibold text-black" : "text-sm font-semibold text-zinc-200"}>
+                        {TREE_PRESETS[preset].label}
+                      </div>
+                      <div className={active ? "mt-1 text-[11px] text-black/70" : "mt-1 text-[11px] text-zinc-500"}>
+                        Bets {TREE_PRESETS[preset].bets} · Raises {TREE_PRESETS[preset].raises}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
-              <div className="grid gap-2 md:grid-cols-2">
-                {ACTION_LABELS.map(({ key, label }) => (
-                  <label className="block" key={key}>
-                    <span className="mb-1 block text-xs text-zinc-500">
-                      {label}
-                      {actionConfig[key] !== baselineConfig[key] && <span className="ml-1 text-amber-200">changed</span>}
-                    </span>
-                    <input
-                      className="h-9 w-full rounded border border-white/10 bg-[#26272a] px-2 font-mono text-xs outline-none focus:border-sky-300/70"
-                      value={actionConfig[key]}
-                      onChange={(event) => updateActionConfig(key, event.target.value)}
-                    />
-                  </label>
-                ))}
-              </div>
+              <p className="mt-3 text-xs leading-relaxed text-zinc-500">{activePresetMeta.description}</p>
             </section>
 
             <section className="rounded border border-white/10 bg-[#202124] p-3">
@@ -2856,7 +2872,7 @@ export default function SolvePage() {
                   <label className="block" key={key}>
                     <span className="mb-1 block text-xs text-zinc-500">
                       {label}
-                      {actionConfig[key] !== baselineConfig[key] && <span className="ml-1 text-amber-200">changed</span>}
+                      {actionConfig[key] !== presetActionConfig[key] && <span className="ml-1 text-amber-200">changed</span>}
                     </span>
                     <input
                       className="h-9 w-full rounded border border-white/10 bg-[#26272a] px-2 text-sm outline-none focus:border-sky-300/70"
@@ -2900,7 +2916,7 @@ export default function SolvePage() {
                 onClick={resetAdvancedToBaseline}
                 type="button"
               >
-                Reset to baseline
+                Reset to Simple Solve
               </button>
               <button
                 className="rounded bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200"
