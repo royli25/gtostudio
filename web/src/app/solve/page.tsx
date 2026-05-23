@@ -932,7 +932,6 @@ export default function SolvePage() {
     if (!results || !nodeLockEnabled || lockedHandCount === 0) return null;
     return buildPaintedNodeLock(results, nodeLockHands);
   }, [lockedHandCount, nodeLockEnabled, nodeLockHands, results]);
-  const primaryActionIndex = actions.length > 1 ? 1 : 0;
   const baselineConfig = useMemo(() => buildBaselineActionConfig(potType), [potType]);
   const solverConfig = useMemo<SolverConfig>(() => ({
     oopRange,
@@ -1436,17 +1435,6 @@ export default function SolvePage() {
               type="button"
             >
               Study
-            </button>
-            <button
-              className={
-                centerView === "ranges"
-                  ? "rounded bg-white/8 px-3 py-1.5 text-zinc-100"
-                  : "rounded px-3 py-1.5 hover:bg-white/6"
-              }
-              onClick={() => setCenterView("ranges")}
-              type="button"
-            >
-              Ranges
             </button>
             <button className="rounded px-3 py-1.5 hover:bg-white/6">Sessions</button>
           </nav>
@@ -2044,6 +2032,7 @@ export default function SolvePage() {
             }}
           >
             {matrix.map((cell) => {
+              const primaryActionIndex = actions.length > 1 ? 1 : 0;
               const primaryFreq = cell.actionFreqs[primaryActionIndex] ?? 0;
               const secondaryFreq = cell.actionFreqs[0] ?? 0;
               const locked = cell.comboCount === 0;
@@ -2055,7 +2044,7 @@ export default function SolvePage() {
                 : -1;
               const background = locked
                 ? "#26272a"
-                : `linear-gradient(90deg, ${colorForAction(primaryActionIndex, actions[primaryActionIndex])} 0 ${Math.round(primaryFreq * 100)}%, ${colorForAction(0, actions[0])} ${Math.round(primaryFreq * 100)}% 100%)`;
+                : comboStrategyGradient(cell.actionFreqs, actions);
 
               return (
                 <button
