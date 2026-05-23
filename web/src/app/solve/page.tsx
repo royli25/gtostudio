@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -237,6 +238,14 @@ const TREE_PRESETS: Record<TreePreset, {
   },
 };
 
+const DEFAULT_TREE_TUNING = {
+  rakeRate: 0,
+  rakeCap: 0,
+  addAllinThreshold: 0,
+  forceAllinThreshold: 0.15,
+  mergingThreshold: 0.1,
+} satisfies Pick<SolverConfig, NumericSolverConfigKey>;
+
 const NUMERIC_LABELS: Array<{ key: NumericSolverConfigKey; label: string }> = [
   { key: "rakeRate", label: "Rake rate" },
   { key: "rakeCap", label: "Rake cap" },
@@ -263,11 +272,7 @@ function buildTreePresetActionConfig(
     oopRiverRaise: raises,
     ipRiverBet: bets,
     ipRiverRaise: raises,
-    rakeRate: 0,
-    rakeCap: 0,
-    addAllinThreshold: 0,
-    forceAllinThreshold: 0,
-    mergingThreshold: 0,
+    ...DEFAULT_TREE_TUNING,
   };
 }
 
@@ -962,7 +967,7 @@ function Modal({
             Close
           </button>
         </div>
-        <div className="max-h-[75vh] overflow-y-auto p-4">{children}</div>
+        <div className="scrollbar-hidden max-h-[75vh] overflow-y-auto p-4">{children}</div>
       </div>
     </div>
   );
@@ -1086,9 +1091,6 @@ export default function SolvePage() {
       ...buildTreePresetActionConfig(preset),
       rakeRate: current.rakeRate,
       rakeCap: current.rakeCap,
-      addAllinThreshold: current.addAllinThreshold,
-      forceAllinThreshold: current.forceAllinThreshold,
-      mergingThreshold: current.mergingThreshold,
     }));
   }, []);
 
@@ -1601,6 +1603,9 @@ export default function SolvePage() {
               Study
             </button>
             <button className="rounded px-3 py-1.5 hover:bg-white/6">Sessions</button>
+            <Link className="rounded px-3 py-1.5 hover:bg-white/6" href="/simulations">
+              Simulations
+            </Link>
           </nav>
         </div>
         <div className="flex items-center gap-2 text-sm">
@@ -1617,7 +1622,7 @@ export default function SolvePage() {
       </header>
 
       <div className="grid h-[calc(100vh-3.5rem)] grid-cols-1 overflow-hidden xl:grid-cols-[360px_minmax(520px,1fr)_430px]">
-        <aside className="overflow-y-auto border-r border-white/10 bg-[#161719] p-4">
+        <aside className="scrollbar-hidden overflow-y-auto border-r border-white/10 bg-[#161719] p-4">
           <section className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
@@ -1918,8 +1923,8 @@ export default function SolvePage() {
           )}
         </aside>
 
-        <section className="min-w-0 overflow-y-auto bg-[#111214] p-3">
-          <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
+        <section className="scrollbar-hidden min-w-0 overflow-y-auto bg-[#111214] p-3">
+          <div className="scrollbar-hidden mb-2 flex gap-2 overflow-x-auto pb-1">
             {nodeLoading && (
               <span className="shrink-0 self-center rounded bg-sky-300/10 px-2.5 py-1.5 text-xs text-sky-200">
                 Loading node...
@@ -2265,7 +2270,7 @@ export default function SolvePage() {
           )}
         </section>
 
-        <aside className="overflow-y-auto border-l border-white/10 bg-[#161719] p-4">
+        <aside className="scrollbar-hidden overflow-y-auto border-l border-white/10 bg-[#161719] p-4">
           {nodeLockEnabled ? (
             <button
               className="mb-4 h-11 w-full rounded bg-sky-300 font-semibold text-black transition hover:bg-sky-200 disabled:bg-zinc-700 disabled:text-zinc-400"
@@ -2515,7 +2520,7 @@ export default function SolvePage() {
                       Solve the current spot, then hover the matrix to populate combo frequencies.
                     </p>
                   ) : (
-                    <div className="grid max-h-72 grid-cols-2 gap-1 overflow-y-auto pr-1">
+                    <div className="scrollbar-hidden grid max-h-72 grid-cols-2 gap-1 overflow-y-auto pr-1">
                       {activeComboRows.map((row) => {
                         const tileBackground = comboStrategyGradient(row.freqs, actions);
 
@@ -2586,7 +2591,7 @@ export default function SolvePage() {
               <h2 className="text-sm font-semibold">Run Log</h2>
               <span className="text-xs text-zinc-500">{logs.length} lines</span>
             </div>
-            <div className="h-52 space-y-1 overflow-y-auto rounded bg-black/30 p-2 font-mono text-xs">
+            <div className="scrollbar-hidden h-52 space-y-1 overflow-y-auto rounded bg-black/30 p-2 font-mono text-xs">
               {logs.length === 0 && <p className="text-zinc-600">No solve started.</p>}
               {logs.map((log, index) => (
                 <div key={`${log.time}-${index}`} className={log.message.startsWith("ERROR") ? "text-red-300" : "text-zinc-400"}>
@@ -2865,7 +2870,7 @@ export default function SolvePage() {
             <section className="rounded border border-white/10 bg-[#202124] p-3">
               <h3 className="text-sm font-semibold">Rake and tree tuning</h3>
               <p className="mt-1 text-xs text-zinc-500">
-                Keep these at zero unless you intentionally want rake or all-in/merge behavior.
+                Presets enable force-all-in (0.15) and bet merging (0.1). Change only if you need custom tree behavior or rake.
               </p>
               <div className="mt-3 grid gap-2 md:grid-cols-2">
                 {NUMERIC_LABELS.map(({ key, label }) => (
@@ -2905,7 +2910,7 @@ export default function SolvePage() {
                   ))}
                 </ul>
               )}
-              <pre className="max-h-72 overflow-auto rounded bg-black/30 p-3 text-xs text-zinc-300">
+              <pre className="scrollbar-hidden max-h-72 overflow-auto rounded bg-black/30 p-3 text-xs text-zinc-300">
                 {JSON.stringify(solverConfig, null, 2)}
               </pre>
             </section>
