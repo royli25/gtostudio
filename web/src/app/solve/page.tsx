@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import Image from "next/image";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 interface SolveLog {
@@ -35,6 +36,15 @@ interface MatrixCell {
   label: string;
   actionFreqs: number[];
   comboCount: number;
+}
+
+interface ComboRow {
+  cardA: string;
+  cardB: string;
+  cards: string;
+  freqs: number[];
+  handIndex: number;
+  label: string;
 }
 
 interface PathSegment {
@@ -158,6 +168,37 @@ type ActionSolverConfigKey = Exclude<
   keyof SolverConfig,
   "oopRange" | "ipRange" | "board" | "startingPot" | "effectiveStack" | NumericSolverConfigKey
 >;
+
+type SolverActionConfig = Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey>;
+
+interface DevSolveFixture {
+  actionConfig: SolverActionConfig;
+  boardSlots: string[];
+  description: string;
+  effectiveStack: number;
+  gameType: GameType;
+  heroPosition: string;
+  id: string;
+  ipRange: string;
+  label: string;
+  maxIterations: number;
+  memoryUsageMB: number;
+  nodes: Array<{ history: number[]; result: SolveResults }>;
+  oopRange: string;
+  potType: PotType;
+  progress: ProgressPoint;
+  startingPot: number;
+  targetExpl: number;
+  villainPosition: string;
+}
+
+interface DevFixtureMode {
+  id: string;
+  label: string;
+  nodes: Record<string, SolveResults>;
+}
+
+const DEV_SOLVE_FIXTURES_ENABLED = process.env.NODE_ENV !== "production";
 
 const ACTION_LABELS: Array<{ key: ActionSolverConfigKey; label: string; raise: boolean }> = [
   { key: "oopFlopBet", label: "OOP flop bet", raise: false },
@@ -395,9 +436,46 @@ function formatAction(action: string): string {
   return action.replaceAll("Bet(", "Bet ").replaceAll("Raise(", "Raise ").replaceAll(")", "");
 }
 
-function colorForAction(index: number): string {
-  const colors = ["#3f7fba", "#e24a42", "#8b2824", "#43a86b"];
+function colorForAction(index: number, action = ""): string {
+  const normalized = action.toLowerCase();
+
+  if (normalized.includes("check") || normalized.includes("call")) return "#58b96a";
+  if (normalized.includes("fold")) return "#3f7fba";
+  if (normalized.includes("bet") || normalized.includes("raise") || normalized.includes("allin")) return "#e24a42";
+
+  const colors = ["#58b96a", "#e24a42", "#3f7fba", "#8b2824"];
   return colors[index % colors.length];
+}
+
+function colorForComboTile(action: string, index: number): string {
+  return colorForAction(index, action);
+}
+
+function comboStrategyGradient(freqs: number[], actions: string[]): string {
+  const clamped = freqs.map((freq) => Math.max(0, Math.min(1, Number.isFinite(freq) ? freq : 0)));
+  const total = clamped.reduce((sum, freq) => sum + freq, 0);
+
+  if (total <= 0) return "#25262a";
+
+  let cursor = 0;
+  const stops = clamped.flatMap((freq, index) => {
+    if (freq <= 0) return [];
+
+    const start = cursor;
+    const end = cursor + (freq / total) * 100;
+    cursor = end;
+    const color = colorForComboTile(actions[index] ?? "", index);
+
+    return [`${color} ${start.toFixed(2)}%`, `${color} ${end.toFixed(2)}%`];
+  });
+
+  return `linear-gradient(90deg, ${stops.join(", ")})`;
+}
+
+function formatStrategyPercent(freq: number): string {
+  const pct = Math.max(0, Math.min(100, freq * 100));
+  if (Math.abs(pct - Math.round(pct)) < 0.05) return String(Math.round(pct));
+  return pct.toFixed(1);
 }
 
 function streetForBoardLength(length: number): "FLOP" | "TURN" | "RIVER" {
@@ -450,19 +528,46 @@ function buildMatrix(results: SolveResults | null): MatrixCell[] {
   });
 }
 
-function buildComboRows(results: SolveResults | null, limit = 12) {
-  if (!results) return [];
+function buildComboRow(results: SolveResults, hand: number, numHands: number): ComboRow {
+  const cardA = results.privateCards[hand * 2];
+  const cardB = results.privateCards[hand * 2 + 1];
+  const cardALabel = cardLabelFromId(cardA);
+  const cardBLabel = cardLabelFromId(cardB);
 
-  const numHands = Math.floor(results.privateCards.length / 2);
-  return Array.from({ length: Math.min(numHands, limit) }, (_, hand) => ({
-    cards: `${rankFromCard(results.privateCards[hand * 2])}${suitFromCard(results.privateCards[hand * 2])} ${rankFromCard(results.privateCards[hand * 2 + 1])}${suitFromCard(results.privateCards[hand * 2 + 1])}`,
+  return {
+    cardA: cardALabel,
+    cardB: cardBLabel,
+    cards: `${cardALabel} ${cardBLabel}`,
     handIndex: hand,
-    label: comboLabel(results.privateCards[hand * 2], results.privateCards[hand * 2 + 1]),
+    label: comboLabel(cardA, cardB),
     freqs: Array.from(
       { length: results.numActions },
       (_, action) => results.strategy[action * numHands + hand] ?? 0
     ),
-  }));
+  };
+}
+
+function buildComboRows(results: SolveResults | null, limit = 12): ComboRow[] {
+  if (!results) return [];
+
+  const numHands = Math.floor(results.privateCards.length / 2);
+  return Array.from({ length: Math.min(numHands, limit) }, (_, hand) =>
+    buildComboRow(results, hand, numHands)
+  );
+}
+
+function buildComboRowsForLabel(results: SolveResults | null, label: string | null): ComboRow[] {
+  if (!results || !label) return [];
+
+  const numHands = Math.floor(results.privateCards.length / 2);
+  const rows: ComboRow[] = [];
+
+  for (let hand = 0; hand < numHands; hand++) {
+    const row = buildComboRow(results, hand, numHands);
+    if (row.label === label) rows.push(row);
+  }
+
+  return rows;
 }
 
 function normalizedPercents(values: number[]): number[] {
@@ -515,23 +620,201 @@ function handClassIndices(results: SolveResults, label: string): number[] {
   return indices;
 }
 
-function cardFace(card: string) {
-  const rank = card.slice(0, -1);
-  const suit = card.slice(-1);
-  const suitSymbol: Record<string, string> = {
-    c: "♣",
-    d: "♦",
-    h: "♥",
-    s: "♠",
-  };
+function classNames(...classes: Array<string | false | null | undefined>): string {
+  return classes.filter(Boolean).join(" ");
+}
 
-  return `${rank}${suitSymbol[suit] ?? suit}`;
+const PAINTBRUSH_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="%23e0f2fe" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.37 2.63 14 7l-1.59-1.59a2 2 0 0 0-2.82 0L8 7l9 9 1.59-1.59a2 2 0 0 0 0-2.82L17 10l4.37-4.37a2.12 2.12 0 1 0-3-3Z"/><path d="M9 8 5 12v4h4l4-4"/></svg>'
+)}") 2 22, crosshair`;
+
+function pokerCardAsset(card: string): string {
+  const rank = card.slice(0, -1).toUpperCase().replace("T", "10");
+  const suit = card.slice(-1).toUpperCase();
+  return `/pokercards/${rank}${suit}.svg`;
+}
+
+interface PlayingCardProps {
+  active?: boolean;
+  card?: string;
+  className?: string;
+  disabled?: boolean;
+  onClick?: () => void;
+  placeholder?: ReactNode;
+  tone?: "amber" | "sky" | "zinc";
+}
+
+function PlayingCard({
+  active = false,
+  card,
+  className,
+  disabled = false,
+  onClick,
+  placeholder = "+",
+  tone = "sky",
+}: PlayingCardProps) {
+  const asButton = Boolean(onClick);
+  const hasCard = Boolean(card);
+  const accentClass =
+    tone === "amber"
+      ? "hover:border-amber-200/80 hover:shadow-amber-200/10"
+      : tone === "zinc"
+        ? "hover:border-white/30 hover:shadow-white/5"
+        : "hover:border-sky-300/80 hover:shadow-sky-300/10";
+  const activeClass =
+    tone === "amber"
+      ? "ring-2 ring-amber-200/80 shadow-amber-200/20"
+      : "ring-2 ring-sky-300/80 shadow-sky-300/20";
+  const baseClass = classNames(
+    "group relative block aspect-[3/4] shrink-0 overflow-hidden rounded-md border border-black/10 p-0 text-left font-[family-name:var(--font-dm-sans)] text-white shadow-lg shadow-black/25 outline-none [container-type:inline-size] transition-[transform,box-shadow,opacity] duration-150 ease-out",
+    hasCard ? "border-transparent bg-transparent" : "border-dashed border-white/15 bg-[#2c2d31]",
+    asButton && "active:scale-[0.98]",
+    asButton && !disabled && accentClass,
+    active && activeClass,
+    disabled && "cursor-not-allowed opacity-35",
+    className
+  );
+  const content = card ? (
+    <Image
+      alt={card}
+      className="object-contain"
+      draggable={false}
+      fill
+      sizes="80px"
+      src={pokerCardAsset(card)}
+      unoptimized
+    />
+  ) : (
+    <span className="grid h-full place-items-center text-[52cqw] font-black text-white/55">
+      {placeholder}
+    </span>
+  );
+
+  if (asButton) {
+    return (
+      <button
+        className={baseClass}
+        disabled={disabled}
+        onClick={onClick}
+        style={{ aspectRatio: "3 / 4" }}
+        type="button"
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <span className={baseClass} style={{ aspectRatio: "3 / 4" }}>
+      {content}
+    </span>
+  );
 }
 
 function streetName(cardCount: number): string {
   if (cardCount >= 5) return "River";
   if (cardCount === 4) return "Turn";
   return "Flop";
+}
+
+type CenterView = "strategy" | "ranges" | "breakdown";
+type DetailTab = "hands" | "summary" | "filters" | "blockers";
+type RightLockTab = "strategy" | "frequency" | "lock";
+
+const CENTER_VIEWS: Array<{ id: CenterView; label: string }> = [
+  { id: "strategy", label: "Strategy" },
+  { id: "ranges", label: "Ranges" },
+  { id: "breakdown", label: "Breakdown" },
+];
+
+const RIGHT_LOCK_TABS: Array<{ id: RightLockTab; label: string }> = [
+  { id: "strategy", label: "Set strategy" },
+  { id: "frequency", label: "Set frequency" },
+  { id: "lock", label: "Lock / Unlock" },
+];
+
+const DETAIL_TABS: Array<{ id: DetailTab; label: string }> = [
+  { id: "hands", label: "Hands" },
+  { id: "summary", label: "Summary" },
+  { id: "filters", label: "Filters" },
+  { id: "blockers", label: "Blockers" },
+];
+
+function ComingSoonPanel({
+  title,
+  description,
+  compact = false,
+}: {
+  title: string;
+  description?: string;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={
+        compact
+          ? "flex min-h-48 flex-col items-center justify-center rounded bg-[#25262a] p-6 text-center"
+          : "flex aspect-square max-h-[calc(100vh-8rem)] min-h-[460px] w-full flex-col items-center justify-center rounded border border-white/10 bg-[#1d1e21] p-8 text-center"
+      }
+    >
+      <h2 className={compact ? "text-sm font-semibold text-zinc-100" : "text-lg font-semibold text-zinc-100"}>
+        {title}
+      </h2>
+      {description && (
+        <p className={classNames("max-w-sm text-zinc-500", compact ? "mt-2 text-xs" : "mt-2 text-sm")}>
+          {description}
+        </p>
+      )}
+      <p className="mt-4 rounded bg-white/8 px-3 py-1.5 text-xs font-medium text-zinc-400">Coming soon</p>
+    </div>
+  );
+}
+
+function historyKey(history: number[]): string {
+  return history.join("/");
+}
+
+async function loadDevSolveFixtures(): Promise<DevSolveFixture[]> {
+  const fixtureData = await import("./dev-fixtures/solves.json");
+  return fixtureData.default as DevSolveFixture[];
+}
+
+function cloneFixtureResult(result: SolveResults, history: number[], player = result.player): SolveResults {
+  return {
+    ...result,
+    currentBoard: [...result.currentBoard],
+    history: [...history],
+    player,
+    possibleCards: [...result.possibleCards],
+    privateCards: [...result.privateCards],
+    strategy: [...result.strategy],
+    totalBetAmount: [...result.totalBetAmount],
+  };
+}
+
+function buildDevFixtureNodeMap(fixture: DevSolveFixture): Record<string, SolveResults> {
+  const nodes = Object.fromEntries(
+    fixture.nodes.map((node) => [historyKey(node.history), node.result])
+  ) as Record<string, SolveResults>;
+
+  const mirrorNode = (sourceHistory: number[], targetHistory: number[], player?: string) => {
+    const targetKey = historyKey(targetHistory);
+    const source = nodes[historyKey(sourceHistory)];
+
+    if (!source || nodes[targetKey]) return;
+
+    nodes[targetKey] = cloneFixtureResult(source, targetHistory, player);
+  };
+
+  if (nodes[historyKey([0, 1])]) {
+    mirrorNode([1, 0], [0, 1, 0]);
+    mirrorNode([1, 1], [0, 1, 1]);
+    mirrorNode([1, 1, 0], [0, 1, 1, 0]);
+    mirrorNode([1, 1, 1], [0, 1, 1, 1]);
+    mirrorNode([1, 2], [0, 1, 2], "ip");
+  }
+
+  return nodes;
 }
 
 function Modal({
@@ -572,15 +855,21 @@ export default function SolvePage() {
   const [currentHistory, setCurrentHistory] = useState<number[]>([]);
   const [pathSegments, setPathSegments] = useState<PathSegment[]>([]);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [devFixtures, setDevFixtures] = useState<DevSolveFixture[]>([]);
+  const [devFixturesOpen, setDevFixturesOpen] = useState(false);
+  const [fixtureMode, setFixtureMode] = useState<DevFixtureMode | null>(null);
   const [spotPresetOpen, setSpotPresetOpen] = useState(false);
   const [solveSettingsOpen, setSolveSettingsOpen] = useState(false);
   const [nodeLockBrushAction, setNodeLockBrushAction] = useState(1);
-  const [nodeLockEnabled, setNodeLockEnabled] = useState(true);
-  const [nodeLockOpen, setNodeLockOpen] = useState(false);
-  const [nodeLockHands, setNodeLockHands] = useState<Record<number, number[]>>({});
+  const [nodeLockEnabled, setNodeLockEnabled] = useState(false);
+  const [nodeLocksByHistory, setNodeLocksByHistory] = useState<Record<string, Record<number, number[]>>>({});
   const [nodeLockLabel, setNodeLockLabel] = useState<string | null>(null);
-  const [nodeLockStrategy, setNodeLockStrategy] = useState<number[] | null>(null);
+  const nodeLockPaintingRef = useRef(false);
   const [nodeOpen, setNodeOpen] = useState(false);
+  const [hoveredHandLabel, setHoveredHandLabel] = useState<string | null>(null);
+  const [centerView, setCenterView] = useState<CenterView>("strategy");
+  const [detailTab, setDetailTab] = useState<DetailTab>("hands");
+  const [rightLockTab, setRightLockTab] = useState<RightLockTab>("strategy");
 
   const [gameType, setGameType] = useState<GameType>("6-max");
   const [heroPosition, setHeroPosition] = useState("UTG");
@@ -593,6 +882,8 @@ export default function SolvePage() {
   const [boardSlots, setBoardSlots] = useState(["Qs", "Jh", "2h"]);
   const [activeBoardSlot, setActiveBoardSlot] = useState<number | null>(null);
   const [activeCardRank, setActiveCardRank] = useState("A");
+  const [chancePickerOpen, setChancePickerOpen] = useState(false);
+  const [activeChanceRank, setActiveChanceRank] = useState("A");
   const [startingPot, setStartingPot] = useState(180);
   const [effectiveStack, setEffectiveStack] = useState(910);
   const [maxIterations, setMaxIterations] = useState(200);
@@ -601,8 +892,11 @@ export default function SolvePage() {
 
   const actions = useMemo(() => splitActions(results?.actions ?? "Check, Bet(94)"), [results]);
   const matrix = useMemo(() => buildMatrix(results), [results]);
-  const comboRows = useMemo(() => buildComboRows(results), [results]);
-  const lockPreviewRows = useMemo(() => buildComboRows(results, 24), [results]);
+  const activeHandLabel = hoveredHandLabel ?? matrix.find((cell) => cell.comboCount > 0)?.label ?? null;
+  const activeComboRows = useMemo(
+    () => buildComboRowsForLabel(results, activeHandLabel),
+    [activeHandLabel, results]
+  );
   const actionTotals = useMemo(() => {
     if (!results || results.isChance || results.isTerminal) {
       return actions.map((_, index) => (index === 0 ? 0.54 : 0.46));
@@ -616,7 +910,11 @@ export default function SolvePage() {
         .reduce((sum, value) => sum + value, 0) / numHands
     ));
   }, [actions, results]);
-  const boardCards = boardSlots.filter(Boolean);
+  const boardCards = useMemo(() => boardSlots.filter(Boolean), [boardSlots]);
+  const pathBoardCards = useMemo(
+    () => (results?.currentBoard.length ? results.currentBoard.map(cardLabelFromId) : boardCards).slice(0, 3),
+    [boardCards, results]
+  );
   const selectedBoardCards = useMemo(() => new Set(boardCards), [boardCards]);
   const board = boardCards.join(" ");
   const availablePositions = POSITIONS_BY_GAME[gameType];
@@ -627,7 +925,13 @@ export default function SolvePage() {
   const currentStreet = streetName(results?.currentBoard.length ?? boardCards.length);
   const finalExploitability = progress?.exploitability ?? 0;
   const exploitabilityPct = startingPot > 0 ? (finalExploitability / startingPot) * 100 : 0;
+  const currentNodeLockKey = historyKey(currentHistory);
+  const nodeLockHands = nodeLocksByHistory[currentNodeLockKey] ?? {};
   const lockedHandCount = Object.keys(nodeLockHands).length;
+  const pendingNodeLockStrategy = useMemo(() => {
+    if (!results || !nodeLockEnabled || lockedHandCount === 0) return null;
+    return buildPaintedNodeLock(results, nodeLockHands);
+  }, [lockedHandCount, nodeLockEnabled, nodeLockHands, results]);
   const primaryActionIndex = actions.length > 1 ? 1 : 0;
   const baselineConfig = useMemo(() => buildBaselineActionConfig(potType), [potType]);
   const solverConfig = useMemo<SolverConfig>(() => ({
@@ -640,8 +944,6 @@ export default function SolvePage() {
   }), [actionConfig, board, boardCards.length, effectiveStack, ipRange, oopRange, startingPot]);
   const validationErrors = useMemo(() => validateSolveConfig(solverConfig, boardSlots), [boardSlots, solverConfig]);
   const betSummary = useMemo(() => formatBetSummary(actionConfig, baselineConfig), [actionConfig, baselineConfig]);
-  const pathBoard = results?.currentBoard.length ? results.currentBoard : boardCards.map((card) => CARD_MAP[card]).filter((card) => card !== undefined);
-  const pathFlopLabel = pathBoard.slice(0, 3).map(cardLabelFromId).join(" ");
   const currentNodeLabel = results?.isTerminal
     ? "Terminal"
     : results?.isChance
@@ -658,6 +960,66 @@ export default function SolvePage() {
       { time: new Date().toLocaleTimeString(), message },
     ]);
   }, []);
+
+  const openDevFixtures = useCallback(async () => {
+    if (!DEV_SOLVE_FIXTURES_ENABLED) return;
+
+    try {
+      const fixtures = await loadDevSolveFixtures();
+      setDevFixtures(fixtures);
+      setDevFixturesOpen(true);
+    } catch (err) {
+      addLog(`ERROR: Failed to load dev fixtures: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [addLog]);
+
+  const loadDevFixture = useCallback((fixture: DevSolveFixture) => {
+    const nodes = buildDevFixtureNodeMap(fixture);
+    const root = nodes[historyKey([])];
+
+    if (!root) {
+      addLog(`ERROR: Dev fixture "${fixture.label}" is missing a root node.`);
+      return;
+    }
+
+    workerRef.current?.terminate();
+    workerRef.current = null;
+
+    setGameType(fixture.gameType);
+    setHeroPosition(fixture.heroPosition);
+    setVillainPosition(fixture.villainPosition);
+    setPotType(fixture.potType);
+    setOopRange(fixture.oopRange);
+    setIpRange(fixture.ipRange);
+    setBoardSlots(fixture.boardSlots);
+    setActiveBoardSlot(null);
+    setStartingPot(fixture.startingPot);
+    setEffectiveStack(fixture.effectiveStack);
+    setMaxIterations(fixture.maxIterations);
+    setTargetExpl(fixture.targetExpl);
+    setActionConfig(fixture.actionConfig);
+    setProgress(fixture.progress);
+    setResults(root);
+    setSolving(false);
+    setNodeLoading(false);
+    setCurrentHistory([]);
+    setPathSegments([]);
+    setNodeLocksByHistory({});
+    setNodeLockLabel(null);
+    setFixtureMode({ id: fixture.id, label: fixture.label, nodes });
+    setDevFixturesOpen(false);
+    setLogs([
+      { time: new Date().toLocaleTimeString(), message: `Loaded dev fixture: ${fixture.label}` },
+      {
+        time: new Date().toLocaleTimeString(),
+        message: `Fixture has ${fixture.nodes.length} saved nodes; memory estimate was ${fixture.memoryUsageMB.toFixed(0)} MB.`,
+      },
+      {
+        time: new Date().toLocaleTimeString(),
+        message: `Final fixture exploitability = ${fixture.progress.exploitability.toFixed(4)}`,
+      },
+    ]);
+  }, [addLog]);
 
   const applySpotPreset = useCallback((
     nextGameType: GameType,
@@ -702,13 +1064,30 @@ export default function SolvePage() {
 
   const navigateToHistory = useCallback((history: number[], segments: PathSegment[]) => {
     if (!results || solving || nodeLoading) return;
+
+    setChancePickerOpen(false);
+
+    if (fixtureMode) {
+      const fixtureResult = fixtureMode.nodes[historyKey(history)];
+      if (!fixtureResult) {
+        addLog(`Dev fixture "${fixtureMode.label}" does not include node [${history.join(", ")}].`);
+        return;
+      }
+
+      setCurrentHistory(history);
+      setPathSegments(segments);
+      setResults(fixtureResult);
+      addLog(`${history.length ? "Selected" : "Root"} fixture node: ${fixtureResult.player}`);
+      return;
+    }
+
     if (!workerRef.current) return;
 
     setCurrentHistory(history);
     setPathSegments(segments);
     setNodeLoading(true);
     workerRef.current.postMessage({ type: "get_results", history });
-  }, [nodeLoading, results, solving]);
+  }, [addLog, fixtureMode, nodeLoading, results, solving]);
 
   const navigateAction = useCallback((actionIndex: number, action: string, total: number) => {
     if (!results || results.isChance || results.isTerminal || solving || nodeLoading) return;
@@ -747,6 +1126,7 @@ export default function SolvePage() {
       },
     ];
 
+    setChancePickerOpen(false);
     navigateToHistory(nextHistory, nextSegments);
   }, [currentHistory, navigateToHistory, nodeLoading, pathSegments, results, solving]);
 
@@ -768,6 +1148,18 @@ export default function SolvePage() {
     setActiveBoardSlot(slotIndex);
     setActiveCardRank(boardSlots[slotIndex]?.slice(0, -1) || "A");
   }, [boardSlots]);
+
+  const openChancePicker = useCallback(() => {
+    if (!results?.isChance || results.possibleCards.length === 0) return;
+
+    const rankStillAvailable = results.possibleCards.some((card) => rankFromCard(card) === activeChanceRank);
+    const firstRank =
+      CARD_PICKER_RANKS.split("").find((rank) => results.possibleCards.some((card) => rankFromCard(card) === rank))
+      ?? rankFromCard(results.possibleCards[0]);
+
+    setActiveChanceRank(rankStillAvailable ? activeChanceRank : firstRank);
+    setChancePickerOpen(true);
+  }, [activeChanceRank, results]);
 
   const selectBoardCard = useCallback((card: string) => {
     if (activeBoardSlot === null) return;
@@ -804,6 +1196,7 @@ export default function SolvePage() {
     }
 
     workerRef.current?.terminate();
+    setFixtureMode(null);
     setSolving(true);
     setNodeLoading(false);
     setResults(null);
@@ -811,6 +1204,8 @@ export default function SolvePage() {
     setCurrentHistory(solveHistory);
     if (!activeLock) {
       setPathSegments([]);
+      setNodeLocksByHistory({});
+      setNodeLockLabel(null);
     }
     setLogs([]);
 
@@ -887,6 +1282,10 @@ export default function SolvePage() {
           addLog(`${msg.history?.length ? "Selected" : "Root"} node player: ${msg.player}`);
           addLog(`OOP EV = ${msg.rootEvOop.toFixed(4)}; equity = ${msg.rootEqOop.toFixed(5)}`);
           setSolving(false);
+          if (activeLock) {
+            setNodeLockEnabled(false);
+            addLog("Nodelock applied. Returned to study mode.");
+          }
           break;
         case "log":
           addLog(msg.message);
@@ -925,32 +1324,42 @@ export default function SolvePage() {
     targetExpl,
   ]);
 
-  const openNodeLock = useCallback(() => {
-    if (!results) return;
+  const updateNodeLockHands = useCallback((
+    updater: Record<number, number[]> | ((current: Record<number, number[]>) => Record<number, number[]>)
+  ) => {
+    setNodeLocksByHistory((prev) => {
+      const current = prev[currentNodeLockKey] ?? {};
+      const nextHands = typeof updater === "function" ? updater(current) : updater;
 
-    setNodeLockBrushAction(results.numActions > 1 ? 1 : 0);
-    setNodeLockEnabled(true);
-    setNodeLockHands({});
-    setNodeLockOpen(true);
-  }, [results]);
+      if (Object.keys(nextHands).length === 0) {
+        const { [currentNodeLockKey]: _removed, ...rest } = prev;
+        return rest;
+      }
 
-  const applyNodeLock = useCallback(() => {
-    if (!results || !nodeLockEnabled || lockedHandCount === 0) return;
-
-    const strategy = buildPaintedNodeLock(results, nodeLockHands);
-    const label = `${lockedHandCount} combo${lockedHandCount === 1 ? "" : "s"} locked`;
-
-    setNodeLockStrategy(strategy);
-    setNodeLockLabel(label);
-    setNodeLockOpen(false);
-    handleSolve(strategy);
-  }, [handleSolve, lockedHandCount, nodeLockEnabled, nodeLockHands, results]);
+      return { ...prev, [currentNodeLockKey]: nextHands };
+    });
+  }, [currentNodeLockKey]);
 
   const clearNodeLock = useCallback(() => {
-    setNodeLockHands({});
-    setNodeLockStrategy(null);
+    setNodeLocksByHistory((prev) => {
+      const { [currentNodeLockKey]: _removed, ...rest } = prev;
+      return rest;
+    });
     setNodeLockLabel(null);
-  }, []);
+  }, [currentNodeLockKey]);
+
+  const unpaintHandClass = useCallback((label: string) => {
+    if (!results) return;
+
+    const indices = handClassIndices(results, label);
+    updateNodeLockHands((current) => {
+      const next = { ...current };
+      indices.forEach((hand) => {
+        delete next[hand];
+      });
+      return next;
+    });
+  }, [results, updateNodeLockHands]);
 
   const paintHandClass = useCallback((label: string) => {
     if (!results || !nodeLockEnabled) return;
@@ -958,57 +1367,93 @@ export default function SolvePage() {
     const actionStrategy = oneHotStrategy(results.numActions, nodeLockBrushAction);
     const indices = handClassIndices(results, label);
 
-    setNodeLockHands((current) => {
+    updateNodeLockHands((current) => {
       const next = { ...current };
       indices.forEach((hand) => {
         next[hand] = actionStrategy;
       });
       return next;
     });
-  }, [nodeLockBrushAction, nodeLockEnabled, results]);
+  }, [nodeLockBrushAction, nodeLockEnabled, results, updateNodeLockHands]);
 
-  const toggleComboLock = useCallback((handIndex: number, checked: boolean) => {
-    if (!results) return;
+  useEffect(() => {
+    if (!nodeLockEnabled) return;
 
-    setNodeLockHands((current) => {
-      const next = { ...current };
-      if (checked) {
-        next[handIndex] = oneHotStrategy(results.numActions, nodeLockBrushAction);
-      } else {
-        delete next[handIndex];
-      }
-      return next;
-    });
-  }, [nodeLockBrushAction, results]);
+    const stopPainting = () => {
+      nodeLockPaintingRef.current = false;
+    };
+
+    window.addEventListener("mouseup", stopPainting);
+    return () => window.removeEventListener("mouseup", stopPainting);
+  }, [nodeLockEnabled]);
+
+  useEffect(() => {
+    if (lockedHandCount === 0) {
+      setNodeLockLabel(null);
+      return;
+    }
+
+    setNodeLockLabel(`${lockedHandCount} combo${lockedHandCount === 1 ? "" : "s"} locked at this node`);
+  }, [lockedHandCount]);
+
+  const beginPaintHandClass = useCallback((label: string, isPainted: boolean) => {
+    if (!nodeLockEnabled) return;
+    if (isPainted) {
+      unpaintHandClass(label);
+      nodeLockPaintingRef.current = false;
+      return;
+    }
+    nodeLockPaintingRef.current = true;
+    paintHandClass(label);
+  }, [nodeLockEnabled, paintHandClass, unpaintHandClass]);
+
+  const continuePaintHandClass = useCallback((label: string) => {
+    if (!nodeLockEnabled || !nodeLockPaintingRef.current) return;
+    paintHandClass(label);
+  }, [nodeLockEnabled, paintHandClass]);
 
   return (
     <main className="h-screen overflow-hidden bg-[#101112] text-zinc-100">
       <header className="flex h-14 items-center justify-between border-b border-white/10 bg-[#191a1c] px-4">
-        <div className="flex items-center gap-3">
-          <div className="grid size-8 place-items-center rounded bg-sky-300 text-sm font-black text-black">
-            P
-          </div>
-          <div>
-            <div className="text-sm font-semibold leading-4">PostFlop Solver</div>
-            <div className="text-xs text-zinc-500">client-side GTO workspace</div>
-          </div>
+        <div className="flex items-center gap-4">
+          <Image
+            alt="PostFlop Solver"
+            className="h-7 w-auto shrink-0"
+            height={28}
+            priority
+            src="/WhiteLogo.svg"
+            unoptimized
+            width={126}
+          />
           <nav className="ml-5 hidden items-center gap-1 text-sm text-zinc-400 md:flex">
-            <button className="rounded bg-white/8 px-3 py-1.5 text-zinc-100">Study</button>
-            <button className="rounded px-3 py-1.5 hover:bg-white/6">Ranges</button>
-            <button className="rounded px-3 py-1.5 hover:bg-white/6">Sessions</button>
             <button
-              className="rounded px-3 py-1.5 hover:bg-white/6 disabled:text-zinc-700"
-              disabled={!results}
-              onClick={openNodeLock}
+              className={
+                centerView === "strategy"
+                  ? "rounded bg-white/8 px-3 py-1.5 text-zinc-100"
+                  : "rounded px-3 py-1.5 hover:bg-white/6"
+              }
+              onClick={() => setCenterView("strategy")}
               type="button"
             >
-              Nodelock
+              Study
             </button>
+            <button
+              className={
+                centerView === "ranges"
+                  ? "rounded bg-white/8 px-3 py-1.5 text-zinc-100"
+                  : "rounded px-3 py-1.5 hover:bg-white/6"
+              }
+              onClick={() => setCenterView("ranges")}
+              type="button"
+            >
+              Ranges
+            </button>
+            <button className="rounded px-3 py-1.5 hover:bg-white/6">Sessions</button>
           </nav>
         </div>
         <div className="flex items-center gap-2 text-sm">
           <span className="hidden rounded border border-sky-300/30 bg-sky-300/10 px-2.5 py-1 text-sky-200 sm:inline">
-            {solving ? "Solving" : results ? "Solved" : "Ready"}
+            {solving ? "Solving" : fixtureMode ? "Dev fixture" : results ? "Solved" : "Ready"}
           </span>
           <button
             className="rounded bg-white/8 px-3 py-1.5 text-zinc-200 hover:bg-white/12"
@@ -1073,21 +1518,18 @@ export default function SolvePage() {
                   const label = `Flop ${index + 1}`;
 
                   return (
-                    <button
-                      className={
-                        active
-                          ? "grid h-16 place-items-center rounded border border-sky-300 bg-sky-300/10 text-lg font-semibold text-sky-100"
-                          : "grid h-16 place-items-center rounded border border-white/10 bg-[#222326] text-lg font-semibold hover:border-sky-300/60 hover:bg-[#24313a]"
-                      }
-                      key={label}
-                      onClick={() => openBoardSlot(index)}
-                      type="button"
-                    >
-                      <span>{card ? cardFace(card) : "+"}</span>
-                      <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+                    <div className="space-y-1" key={label}>
+                      <PlayingCard
+                        active={active}
+                        card={card || undefined}
+                        className="w-full"
+                        onClick={() => openBoardSlot(index)}
+                        tone="sky"
+                      />
+                      <div className="text-center text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500">
                         {label}
-                      </span>
-                    </button>
+                      </div>
+                    </div>
                   );
                 })}
               </div>
@@ -1152,21 +1594,15 @@ export default function SolvePage() {
                             selectedBoardCards.has(card) && boardSlots[activeBoardSlot] !== card;
 
                           return (
-                            <button
-                              className={
-                                boardSlots[activeBoardSlot] === card
-                                  ? "rounded bg-sky-300 px-2 py-3 text-base font-semibold text-black"
-                                  : selectedInOtherSlot
-                                    ? "rounded bg-black/20 px-2 py-3 text-base text-zinc-700"
-                                    : "rounded bg-[#26272a] px-2 py-3 text-base font-semibold text-zinc-100 hover:bg-[#33353a]"
-                              }
+                            <PlayingCard
+                              active={boardSlots[activeBoardSlot] === card}
+                              card={card}
+                              className="w-full"
                               disabled={selectedInOtherSlot}
                               key={suit}
                               onClick={() => selectBoardCard(card)}
-                              type="button"
-                            >
-                              {cardFace(card)}
-                            </button>
+                              tone="sky"
+                            />
                           );
                         })}
                       </div>
@@ -1246,10 +1682,10 @@ export default function SolvePage() {
                 <button
                   className="h-11 w-full rounded bg-sky-300 font-semibold text-black transition hover:bg-sky-200 disabled:bg-zinc-700 disabled:text-zinc-400"
                   disabled={solving || validationErrors.length > 0}
-                  onClick={() => handleSolve(nodeLockStrategy)}
+                  onClick={() => handleSolve(pendingNodeLockStrategy)}
                   type="button"
                 >
-                  {solving ? "Solving..." : nodeLockStrategy ? "Solve With Lock" : "Solve Tree"}
+                  {solving ? "Solving..." : pendingNodeLockStrategy ? "Solve With Lock" : "Solve Tree"}
                 </button>
                 <button
                   aria-label="Solve settings"
@@ -1269,6 +1705,33 @@ export default function SolvePage() {
                   Cancel
                 </button>
               )}
+              {DEV_SOLVE_FIXTURES_ENABLED && (
+                <div className="rounded border border-amber-300/30 bg-amber-300/10 p-3">
+                  <div className="mb-2 flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-wide text-amber-100">Development</div>
+                      <div className="mt-1 text-xs text-zinc-400">
+                        Load a saved solved spot without running the worker.
+                      </div>
+                    </div>
+                    {fixtureMode && (
+                      <span className="rounded bg-black/20 px-2 py-1 text-[10px] text-amber-100">
+                        Fixture
+                      </span>
+                    )}
+                  </div>
+                  {fixtureMode && (
+                    <div className="mb-2 truncate text-xs text-zinc-300">{fixtureMode.label}</div>
+                  )}
+                  <button
+                    className="h-9 w-full rounded bg-amber-200 text-sm font-semibold text-black hover:bg-amber-100"
+                    onClick={openDevFixtures}
+                    type="button"
+                  >
+                    Load Dev Fixture
+                  </button>
+                </div>
+              )}
             </div>
           </section>
 
@@ -1285,12 +1748,12 @@ export default function SolvePage() {
               <span className="text-lg text-zinc-500">›</span>
             </button>
           </section>
-          {nodeLockLabel && (
-            <section className="mt-3 rounded border border-sky-300/30 bg-[#10242c] p-3">
+          {nodeLockLabel && !nodeLockEnabled && (
+            <section className="mt-3 rounded border border-sky-300/20 bg-[#10242c]/60 p-3">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="text-sm font-semibold text-sky-100">Nodelock queued</div>
-                  <div className="mt-1 text-xs text-zinc-400">{nodeLockLabel}</div>
+                  <div className="text-sm font-semibold text-zinc-300">Manual locks</div>
+                  <div className="mt-1 text-xs text-zinc-500">{nodeLockLabel} — highlighted on the matrix</div>
                 </div>
                 <button
                   className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
@@ -1304,73 +1767,72 @@ export default function SolvePage() {
           )}
         </aside>
 
-        <section className="min-w-0 overflow-y-auto bg-[#111214] p-4">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-sm">
-              <button className="rounded bg-white/10 px-3 py-1.5 font-medium">Strategy</button>
-              <button className="rounded px-3 py-1.5 text-zinc-400 hover:bg-white/6">Ranges</button>
-              <button className="rounded px-3 py-1.5 text-zinc-400 hover:bg-white/6">Breakdown</button>
-            </div>
-            <div className="flex items-center gap-2 text-xs text-zinc-500">
-              <span>{progress ? `${progress.iteration}/${maxIterations}` : "0/0"}</span>
-              <span>Exploitability {exploitabilityPct.toFixed(3)}%</span>
-            </div>
-          </div>
-
-          <div className="mb-3 rounded border border-white/10 bg-[#1a1b1e] p-3">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Action path</div>
-                <div className="text-sm text-zinc-200">{currentNodeLabel}</div>
-              </div>
-              {nodeLoading && <span className="text-xs text-sky-200">Loading node...</span>}
-            </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
+        <section className="min-w-0 overflow-y-auto bg-[#111214] p-3">
+          <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
+            {nodeLoading && (
+              <span className="shrink-0 self-center rounded bg-sky-300/10 px-2.5 py-1.5 text-xs text-sky-200">
+                Loading node...
+              </span>
+            )}
               <button
-                className="min-h-28 min-w-36 rounded border border-sky-300/30 bg-sky-300/10 px-3 py-2 text-left text-xs text-sky-100 hover:bg-sky-300/15 disabled:opacity-50"
+                className="flex h-28 min-w-28 shrink-0 flex-col overflow-hidden rounded border border-sky-300/30 bg-sky-300/10 px-2.5 py-3 text-left text-xs text-sky-100 hover:bg-sky-300/15 disabled:opacity-50"
                 disabled={!results || solving || nodeLoading}
                 onClick={jumpToRoot}
                 type="button"
               >
-                <span className="mb-2 block font-semibold">FLOP</span>
-                <span className="font-mono text-zinc-200">{pathFlopLabel || board}</span>
+                <span className="block font-semibold leading-none">FLOP</span>
+                <div className="mt-3 flex gap-1">
+                  {pathBoardCards.map((card) => (
+                    <PlayingCard
+                      card={card}
+                      className="w-7 rounded shadow-sm shadow-black/20"
+                      key={card}
+                      tone="zinc"
+                    />
+                  ))}
+                </div>
+                {pathBoardCards.length === 0 && (
+                  <span className="mt-3 rounded bg-black/20 px-2 py-1 text-[11px] text-sky-100/70">
+                    Board
+                  </span>
+                )}
               </button>
               {pathSegments.map((segment) => {
                 if (segment.kind === "chance") {
                   return (
                     <button
-                      className="min-h-28 min-w-32 rounded border border-white/10 bg-[#242529] px-3 py-2 text-left text-xs text-zinc-200 hover:border-sky-300/40 hover:bg-[#26313a] disabled:opacity-50"
+                      className="flex h-28 min-w-20 shrink-0 flex-col overflow-hidden rounded border border-white/10 bg-[#242529] px-2.5 py-3 text-left text-xs text-zinc-200 hover:border-sky-300/40 hover:bg-[#26313a] disabled:opacity-50"
                       disabled={!results || solving || nodeLoading}
                       key={segment.id}
                       onClick={() => jumpToSegment(segment)}
                       type="button"
                     >
-                      <span className="mb-2 block font-semibold">{segment.meta}</span>
-                      <span className="font-mono text-base text-zinc-100">{segment.label}</span>
+                      <span className="mb-2 block font-semibold leading-none">{segment.meta}</span>
+                      <PlayingCard card={segment.label} className="w-14 shadow-black/15" tone="zinc" />
                     </button>
                   );
                 }
 
                 return (
                   <div
-                    className="min-h-28 min-w-36 rounded border border-white/10 bg-[#242529] px-3 py-2 text-xs text-zinc-200"
+                    className="h-28 min-w-24 shrink-0 overflow-hidden rounded border border-white/10 bg-[#242529] px-2.5 py-3 text-xs text-zinc-200"
                     key={segment.id}
                   >
                     <button
-                      className="mb-2 block w-full text-left font-semibold text-zinc-200 hover:text-sky-100 disabled:opacity-50"
+                      className="mb-1 block w-full rounded px-1.5 text-left font-semibold leading-none text-zinc-200 hover:text-sky-100 disabled:opacity-50"
                       disabled={!results || solving || nodeLoading}
                       onClick={() => jumpToSegment(segment)}
                       type="button"
                     >
                       {segment.player}
                     </button>
-                    <div className="space-y-1">
+                    <div className="space-y-0.5">
                       {(segment.actions ?? []).map((action, index) => (
                         <button
                           className={
                             index === segment.selectedActionIndex
-                              ? "block w-full rounded bg-sky-300/25 px-2 py-1 text-left font-medium text-sky-100"
-                              : "block w-full rounded px-2 py-1 text-left text-zinc-400 hover:bg-white/8 hover:text-zinc-100"
+                              ? "block w-full rounded bg-sky-300/25 px-1.5 py-0.5 text-left font-medium text-sky-100"
+                              : "block w-full rounded px-1.5 py-0.5 text-left text-zinc-400 hover:bg-white/8 hover:text-zinc-100"
                           }
                           disabled={!results || solving || nodeLoading}
                           key={`${segment.id}-${action}`}
@@ -1385,38 +1847,113 @@ export default function SolvePage() {
                 );
               })}
               {results?.isChance && (
-                <div className="min-h-28 min-w-64 rounded border border-amber-300/70 bg-amber-300/10 px-3 py-2 text-xs text-zinc-200">
+                <div className="relative flex h-28 min-w-24 shrink-0 flex-col overflow-hidden rounded border border-amber-300/70 bg-amber-300/10 px-2.5 py-3 text-xs text-zinc-200">
                   <div className="mb-2">
-                    <div className="font-semibold text-amber-100">
+                    <div className="font-semibold leading-none text-amber-100">
                       {streetForBoardLength(results.currentBoard.length + 1)}
                     </div>
-                    <div className="text-zinc-500">
-                      Choose {results.currentBoard.length === 3 ? "turn" : "river"} card
-                    </div>
                   </div>
-                  <div className="grid grid-cols-4 gap-1">
-                    {results.possibleCards.map((card) => (
-                      <button
-                        className="rounded bg-[#25262a] px-2 py-2 font-mono text-xs text-zinc-100 hover:bg-amber-300/20 disabled:opacity-50"
-                        disabled={solving || nodeLoading}
-                        key={card}
-                        onClick={() => navigateChanceCard(card)}
-                        type="button"
+                  <PlayingCard
+                    className="w-14 border-dashed"
+                    disabled={solving || nodeLoading || results.possibleCards.length === 0}
+                    onClick={openChancePicker}
+                    placeholder="+"
+                    tone="amber"
+                  />
+                  {chancePickerOpen && (
+                    <div
+                      className="fixed inset-0 z-50 bg-black/20"
+                      onClick={() => setChancePickerOpen(false)}
+                    >
+                      <div
+                        className="absolute left-1/2 top-24 w-72 -translate-x-1/2 rounded border border-amber-200/40 bg-[#1d1e21] p-3 text-zinc-100 shadow-2xl shadow-black/50"
+                        onClick={(event) => event.stopPropagation()}
                       >
-                        {cardLabelFromId(card)}
-                      </button>
-                    ))}
-                  </div>
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-amber-100">Select card</div>
+                            <div className="text-xs text-zinc-500">
+                              Pick rank, then suit
+                            </div>
+                          </div>
+                          <button
+                            className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
+                            onClick={() => setChancePickerOpen(false)}
+                            type="button"
+                          >
+                            Close
+                          </button>
+                        </div>
+                        <div className="space-y-3">
+                          <div>
+                            <div className="mb-1.5 text-xs font-medium text-zinc-500">Rank</div>
+                            <div className="grid grid-cols-7 gap-1.5">
+                              {CARD_PICKER_RANKS.split("").map((rank) => {
+                                const rankAvailable = results.possibleCards.some((card) => rankFromCard(card) === rank);
+
+                                return (
+                                  <button
+                                    className={
+                                      activeChanceRank === rank
+                                        ? "rounded bg-amber-200 px-2 py-2 text-sm font-semibold text-black"
+                                        : rankAvailable
+                                          ? "rounded bg-[#26272a] px-2 py-2 text-sm font-semibold text-zinc-100 hover:bg-[#33353a]"
+                                          : "rounded bg-black/20 px-2 py-2 text-sm text-zinc-700"
+                                    }
+                                    disabled={!rankAvailable}
+                                    key={rank}
+                                    onClick={() => setActiveChanceRank(rank)}
+                                    type="button"
+                                  >
+                                    {rank}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="mb-1.5 flex items-center justify-between">
+                              <span className="text-xs font-medium text-zinc-500">Suit</span>
+                              <span className="text-xs text-zinc-600">Pick {activeChanceRank} suit</span>
+                            </div>
+                            <div className="grid grid-cols-4 gap-1.5">
+                              {CARD_PICKER_SUITS.split("").map((suit) => {
+                                const card = `${activeChanceRank}${suit}`;
+                                const cardId = CARD_MAP[card];
+                                const possible = cardId !== undefined && results.possibleCards.includes(cardId);
+
+                                return (
+                                  <PlayingCard
+                                    card={card}
+                                    className="w-full"
+                                    disabled={!possible || solving || nodeLoading}
+                                    key={suit}
+                                    onClick={() => {
+                                      if (possible) navigateChanceCard(cardId);
+                                    }}
+                                    tone="amber"
+                                  />
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {!chancePickerOpen && results.possibleCards.length === 0 && (
+                    <div className="mt-2 text-xs text-zinc-500">No legal cards available.</div>
+                  )}
                 </div>
               )}
               {results && !results.isChance && !results.isTerminal && (
-                <div className="min-h-28 min-w-36 rounded border border-amber-300/70 bg-amber-300/10 px-3 py-2 text-xs text-zinc-200">
-                  <div className="mb-2 font-semibold text-amber-100">{actingSeat}</div>
-                  <div className="space-y-1">
+                <div className="h-28 min-w-24 shrink-0 overflow-hidden rounded border border-amber-300/70 bg-amber-300/10 px-2.5 py-3 text-xs text-zinc-200">
+                  <div className="mb-1 rounded px-1.5 font-semibold leading-none text-amber-100">{actingSeat}</div>
+                  <div className="space-y-0.5">
                     {actions.map((action, index) => (
                       <button
-                        className="block w-full rounded px-2 py-1 text-left text-zinc-100 hover:bg-amber-300/20 disabled:opacity-50"
                         disabled={solving || nodeLoading}
+                        className="block w-full rounded px-1.5 py-0.5 text-left text-zinc-100 hover:bg-amber-300/20 disabled:opacity-50"
                         key={`current-${action}`}
                         onClick={() => navigateAction(index, action, actionTotals[index] ?? 0)}
                         type="button"
@@ -1427,27 +1964,133 @@ export default function SolvePage() {
                   </div>
                 </div>
               )}
+          </div>
+
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {CENTER_VIEWS.map(({ id, label }) => (
+                <button
+                  className={
+                    centerView === id
+                      ? "rounded bg-white/10 px-3 py-1.5 font-medium text-zinc-100"
+                      : "rounded px-3 py-1.5 text-zinc-400 hover:bg-white/6"
+                  }
+                  key={id}
+                  onClick={() => setCenterView(id)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+              <label
+                className={classNames(
+                  "flex cursor-pointer items-center gap-2 rounded px-3 py-1.5 transition-colors",
+                  nodeLockEnabled || lockedHandCount > 0
+                    ? "bg-sky-300/15 text-sky-100 ring-1 ring-sky-300/40"
+                    : "text-zinc-400 hover:bg-white/6",
+                  (!results || solving || nodeLoading || results.isChance || results.isTerminal) &&
+                    "pointer-events-none opacity-40"
+                )}
+              >
+                <input
+                  checked={nodeLockEnabled}
+                  className="accent-sky-300"
+                  disabled={!results || solving || nodeLoading || results?.isChance || results?.isTerminal}
+                  onChange={(event) => {
+                    const enabled = event.target.checked;
+                    setNodeLockEnabled(enabled);
+                    if (enabled) {
+                      setCenterView("strategy");
+                      setRightLockTab("strategy");
+                      if (results) {
+                        setNodeLockBrushAction(results.numActions > 1 ? 1 : 0);
+                      }
+                    }
+                  }}
+                  type="checkbox"
+                />
+                Nodelocking
+              </label>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-zinc-500">
+              <span>{progress ? `${progress.iteration}/${maxIterations}` : "0/0"}</span>
+              <span>Exploitability {exploitabilityPct.toFixed(3)}%</span>
             </div>
           </div>
 
+          {centerView === "ranges" && (
+            <ComingSoonPanel
+              description="Range composition, weighting, and comparison views for the current spot."
+              title="Ranges"
+            />
+          )}
+
+          {centerView === "breakdown" && (
+            <ComingSoonPanel
+              description="Street-by-street EV, equity, and action-frequency breakdowns."
+              title="Breakdown"
+            />
+          )}
+
+          {centerView === "strategy" && (
           <div
-            className="grid aspect-square max-h-[calc(100vh-8rem)] min-h-[460px] w-full overflow-hidden rounded border border-black/70 bg-black/50"
-            style={{ gridTemplateColumns: "repeat(13, minmax(0, 1fr))" }}
+            className={classNames(
+              "grid aspect-square max-h-[calc(100vh-8rem)] min-h-[460px] w-full overflow-hidden rounded border border-black/70 bg-black/50",
+              nodeLockEnabled && "select-none"
+            )}
+            style={{
+              gridTemplateColumns: "repeat(13, minmax(0, 1fr))",
+              ...(nodeLockEnabled ? { cursor: PAINTBRUSH_CURSOR } : {}),
+            }}
           >
             {matrix.map((cell) => {
               const primaryFreq = cell.actionFreqs[primaryActionIndex] ?? 0;
               const secondaryFreq = cell.actionFreqs[0] ?? 0;
               const locked = cell.comboCount === 0;
+              const handIndices = results ? handClassIndices(results, cell.label) : [];
+              const paintedHand = handIndices.find((hand) => nodeLockHands[hand]);
+              const painted = paintedHand !== undefined;
+              const paintedActionIndex = painted
+                ? (nodeLockHands[paintedHand] ?? []).findIndex((freq) => freq > 0)
+                : -1;
               const background = locked
                 ? "#26272a"
-                : `linear-gradient(90deg, ${colorForAction(primaryActionIndex)} 0 ${Math.round(primaryFreq * 100)}%, ${colorForAction(0)} ${Math.round(primaryFreq * 100)}% 100%)`;
+                : `linear-gradient(90deg, ${colorForAction(primaryActionIndex, actions[primaryActionIndex])} 0 ${Math.round(primaryFreq * 100)}%, ${colorForAction(0, actions[0])} ${Math.round(primaryFreq * 100)}% 100%)`;
 
               return (
-                <div
+                <button
                   key={cell.label}
-                  className="relative min-h-0 border-b border-r border-black/55 p-1.5 text-left"
+                  className={classNames(
+                    "relative min-h-0 border-b border-r border-black/55 p-1.5 text-left outline-none transition-[box-shadow,filter] duration-150 disabled:cursor-default",
+                    !locked && !nodeLockEnabled && "cursor-crosshair hover:z-10 hover:brightness-110 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-sky-200",
+                    !locked && nodeLockEnabled && "hover:z-10 hover:brightness-110 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-sky-200",
+                    painted && "z-10 ring-2 ring-inset ring-sky-300/70",
+                    hoveredHandLabel === cell.label && !nodeLockEnabled && "z-10 ring-2 ring-white/80"
+                  )}
+                  disabled={locked}
+                  onFocus={() => {
+                    if (!locked && !nodeLockEnabled) setHoveredHandLabel(cell.label);
+                  }}
+                  onMouseDown={(event) => {
+                    if (locked || !nodeLockEnabled) return;
+                    event.preventDefault();
+                    beginPaintHandClass(cell.label, painted);
+                  }}
+                  onMouseEnter={() => {
+                    if (locked) return;
+                    if (nodeLockEnabled) {
+                      continuePaintHandClass(cell.label);
+                      return;
+                    }
+                    setHoveredHandLabel(cell.label);
+                  }}
                   style={{ background }}
-                  title={`${cell.label}: ${actions.map((action, i) => `${formatAction(action)} ${Math.round((cell.actionFreqs[i] ?? 0) * 100)}%`).join(", ")}`}
+                  title={
+                    painted
+                      ? `${cell.label}: locked to ${formatAction(actions[paintedActionIndex] ?? actions[0])}${nodeLockEnabled ? " — click to unlock" : ""}`
+                      : `${cell.label}: ${actions.map((action, i) => `${formatAction(action)} ${Math.round((cell.actionFreqs[i] ?? 0) * 100)}%`).join(", ")}`
+                  }
+                  type="button"
                 >
                   <div className={locked ? "text-zinc-600" : "text-white drop-shadow"}>
                     <div className="text-sm font-semibold leading-none md:text-base">{cell.label}</div>
@@ -1457,118 +2100,311 @@ export default function SolvePage() {
                       </div>
                     )}
                   </div>
-                </div>
+                  {painted && (
+                    <div className="pointer-events-none absolute inset-0 bg-sky-400/25 mix-blend-screen" />
+                  )}
+                  {painted && (
+                    <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-sky-200/60" />
+                  )}
+                </button>
               );
             })}
           </div>
+          )}
         </section>
 
         <aside className="overflow-y-auto border-l border-white/10 bg-[#161719] p-4">
-          <div className="mb-4 grid grid-cols-3 gap-2">
-            <div className="rounded border border-sky-300/40 bg-sky-300/10 p-3">
-              <div className="text-xs text-sky-200">OOP EV</div>
-              <div className="text-xl font-semibold">{results ? results.rootEvOop.toFixed(2) : "--"}</div>
+          {nodeLockEnabled ? (
+            <button
+              className="mb-4 h-11 w-full rounded bg-sky-300 font-semibold text-black transition hover:bg-sky-200 disabled:bg-zinc-700 disabled:text-zinc-400"
+              disabled={solving || validationErrors.length > 0 || !pendingNodeLockStrategy}
+              onClick={() => handleSolve(pendingNodeLockStrategy)}
+              type="button"
+            >
+              {solving ? "Solving..." : "Solve With Lock"}
+            </button>
+          ) : (
+            <div className="mb-4 grid grid-cols-3 gap-2">
+              <div className="rounded border border-sky-300/40 bg-sky-300/10 p-3">
+                <div className="text-xs text-sky-200">OOP EV</div>
+                <div className="text-xl font-semibold">{results ? results.rootEvOop.toFixed(2) : "--"}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-[#222326] p-3">
+                <div className="text-xs text-zinc-500">Equity</div>
+                <div className="text-xl font-semibold">{results ? `${(results.rootEqOop * 100).toFixed(1)}%` : "--"}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-[#222326] p-3">
+                <div className="text-xs text-zinc-500">Pot odds</div>
+                <div className="text-xl font-semibold">40%</div>
+              </div>
             </div>
-            <div className="rounded border border-white/10 bg-[#222326] p-3">
-              <div className="text-xs text-zinc-500">Equity</div>
-              <div className="text-xl font-semibold">{results ? `${(results.rootEqOop * 100).toFixed(1)}%` : "--"}</div>
-            </div>
-            <div className="rounded border border-white/10 bg-[#222326] p-3">
-              <div className="text-xs text-zinc-500">Pot odds</div>
-              <div className="text-xl font-semibold">40%</div>
-            </div>
-          </div>
+          )}
 
           <section className="rounded border border-white/10 bg-[#1d1e21] p-3">
-            <div className="mb-3 flex items-center justify-between">
-              <div>
-                <h2 className="text-sm font-semibold">Actions</h2>
-                <span className="text-xs text-zinc-500">{currentNodeLabel}</span>
-              </div>
-              <button
-                className="rounded border border-sky-300/30 bg-sky-300/10 px-2.5 py-1 text-xs font-semibold text-sky-100 hover:bg-sky-300/15 disabled:border-white/10 disabled:bg-white/5 disabled:text-zinc-600"
-                disabled={!results || solving || nodeLoading || results.isChance || results.isTerminal}
-                onClick={openNodeLock}
-                type="button"
-              >
-                Nodelock
-              </button>
-            </div>
-            <div className="space-y-2">
-              {results?.isTerminal && (
-                <div className="rounded bg-[#25262a] p-3 text-sm text-zinc-400">
-                  This line has reached a terminal node.
+            {nodeLockEnabled && results ? (
+              <>
+                <div className="mb-3 flex items-center gap-1 rounded-lg bg-black/25 p-1 text-xs">
+                  {RIGHT_LOCK_TABS.map(({ id, label }) => (
+                    <button
+                      className={
+                        rightLockTab === id
+                          ? "flex flex-1 items-center justify-center rounded-md bg-white px-2 py-2 font-medium text-zinc-900"
+                          : "flex flex-1 items-center justify-center rounded-md px-2 py-2 text-zinc-400 hover:bg-white/6 hover:text-zinc-200"
+                      }
+                      key={id}
+                      onClick={() => setRightLockTab(id)}
+                      type="button"
+                    >
+                      <span className="truncate">{label}</span>
+                    </button>
+                  ))}
                 </div>
-              )}
 
-              {results?.isChance && (
-                <div className="rounded bg-[#25262a] p-3 text-sm text-zinc-400">
-                  Choose the next board card in the action path.
-                </div>
-              )}
+                {rightLockTab === "strategy" && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 gap-2">
+                      {actions.map((action, index) => {
+                        const selected = index === nodeLockBrushAction;
+                        const actionColor = colorForAction(index, action);
+                        const brushPct = selected ? 100 : 0;
 
-              {!results?.isChance && !results?.isTerminal && actions.map((action, index) => {
-                const numHands = results ? Math.floor(results.privateCards.length / 2) : 0;
-                const total = actionTotals[index] ?? 0;
-
-                return (
-                  <button
-                    key={action}
-                    className="block w-full overflow-hidden rounded bg-[#25262a] text-left hover:bg-[#303238] disabled:hover:bg-[#25262a]"
-                    disabled={!results || solving || nodeLoading}
-                    onClick={() => navigateAction(index, action, total)}
-                    type="button"
-                  >
-                    <div className="flex items-end justify-between p-3">
-                      <div>
-                        <div className="text-lg font-semibold">{formatAction(action)}</div>
-                        <div className="text-xs text-zinc-500">{numHands ? `${(total * numHands).toFixed(1)} combos` : "pending"}</div>
-                      </div>
-                      <div className="text-2xl font-semibold">{Math.round(total * 100)}%</div>
+                        return (
+                          <button
+                            className={classNames(
+                              "overflow-hidden rounded-lg text-left text-white transition-[transform,box-shadow] duration-150",
+                              selected ? "ring-2 ring-white/90 ring-offset-2 ring-offset-[#1d1e21]" : "opacity-90 hover:opacity-100"
+                            )}
+                            key={action}
+                            onClick={() => setNodeLockBrushAction(index)}
+                            style={{ background: actionColor }}
+                            type="button"
+                          >
+                            <div className="p-3 pb-2">
+                              <div className="text-sm font-semibold leading-tight">{formatAction(action)}</div>
+                              <div className="mt-2 inline-flex min-w-[3rem] items-center justify-center rounded bg-black/25 px-2 py-1 text-2xl font-semibold tabular-nums">
+                                {brushPct}
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-5 border-t border-black/20 bg-black/15">
+                              {[0, 25, 50, 75, 100].map((pct) => (
+                                <span
+                                  className={classNames(
+                                    "py-1.5 text-center text-[11px] font-medium",
+                                    pct === brushPct && selected ? "bg-black/25 text-white" : "text-white/70"
+                                  )}
+                                  key={pct}
+                                >
+                                  {pct}
+                                </span>
+                              ))}
+                            </div>
+                          </button>
+                        );
+                      })}
                     </div>
-                    <div className="h-2" style={{ background: colorForAction(index), width: `${Math.max(2, total * 100)}%` }} />
-                  </button>
-                );
-              })}
-            </div>
+
+                    <div className="flex h-1.5 overflow-hidden rounded-full bg-[#25262a]">
+                      {actions.map((action, index) => {
+                        const total = actionTotals[index] ?? 0;
+                        if (total <= 0) return null;
+
+                        return (
+                          <div
+                            key={action}
+                            style={{ background: colorForAction(index, action), width: `${total * 100}%` }}
+                          />
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs text-zinc-500">
+                      <span>
+                        {lockedHandCount > 0
+                          ? `${lockedHandCount} combo${lockedHandCount === 1 ? "" : "s"} painted — click cells to unlock`
+                          : "Paint hand classes on the matrix"}
+                      </span>
+                      <button
+                        className="rounded px-2 py-1 text-zinc-400 hover:bg-white/8 hover:text-zinc-200 disabled:opacity-40"
+                        disabled={lockedHandCount === 0}
+                        onClick={clearNodeLock}
+                        type="button"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {rightLockTab === "frequency" && (
+                  <ComingSoonPanel
+                    compact
+                    description="Set mixed action frequencies before painting hand classes."
+                    title="Set frequency"
+                  />
+                )}
+
+                {rightLockTab === "lock" && (
+                  <ComingSoonPanel
+                    compact
+                    description="Bulk lock or unlock hand categories, draws, and equity buckets."
+                    title="Lock / Unlock"
+                  />
+                )}
+              </>
+            ) : (
+              <>
+                <div className="mb-3">
+                  <h2 className="text-sm font-semibold">Actions</h2>
+                  <span className="text-xs text-zinc-500">{currentNodeLabel}</span>
+                </div>
+                <div className="space-y-2">
+                  {results?.isTerminal && (
+                    <div className="rounded bg-[#25262a] p-3 text-sm text-zinc-400">
+                      This line has reached a terminal node.
+                    </div>
+                  )}
+
+                  {results?.isChance && (
+                    <div className="rounded bg-[#25262a] p-3 text-sm text-zinc-400">
+                      Choose the next board card in the action path.
+                    </div>
+                  )}
+
+                  {!results?.isChance && !results?.isTerminal && actions.map((action, index) => {
+                    const numHands = results ? Math.floor(results.privateCards.length / 2) : 0;
+                    const total = actionTotals[index] ?? 0;
+
+                    return (
+                      <button
+                        key={action}
+                        className="block w-full overflow-hidden rounded bg-[#25262a] text-left hover:bg-[#303238] disabled:hover:bg-[#25262a]"
+                        disabled={!results || solving || nodeLoading}
+                        onClick={() => navigateAction(index, action, total)}
+                        type="button"
+                      >
+                        <div className="flex items-end justify-between p-3">
+                          <div>
+                            <div className="text-lg font-semibold">{formatAction(action)}</div>
+                            <div className="text-xs text-zinc-500">{numHands ? `${(total * numHands).toFixed(1)} combos` : "pending"}</div>
+                          </div>
+                          <div className="text-2xl font-semibold">{Math.round(total * 100)}%</div>
+                        </div>
+                        <div className="h-2" style={{ background: colorForAction(index, action), width: `${Math.max(2, total * 100)}%` }} />
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
           </section>
 
-          <section className="mt-4 rounded border border-white/10 bg-[#1d1e21] p-3">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-sm font-semibold">Hands</h2>
-              <button className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300" type="button">
-                Filters
-              </button>
-            </div>
-            <div className="max-h-64 space-y-1 overflow-y-auto pr-1">
-              {comboRows.length === 0 && (
-                <p className="rounded bg-[#25262a] p-3 text-sm text-zinc-500">
-                  Solve the current spot to populate combo frequencies.
-                </p>
-              )}
-              {comboRows.map((row) => (
-                <div key={`${row.cards}-${row.label}`} className="rounded bg-[#25262a] p-2">
-                  <div className="mb-1 flex items-center justify-between">
-                    <span className="font-mono text-sm">{row.cards}</span>
-                    <span className="text-xs text-zinc-500">{row.label}</span>
-                  </div>
-                  <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${Math.max(1, actions.length)}, minmax(0, 1fr))` }}>
-                    {actions.map((action, index) => (
-                      <div key={action} className="h-6 overflow-hidden rounded bg-black/30 text-[10px]">
-                        <div
-                          className="flex h-full items-center px-1.5 text-white"
-                          style={{
-                            background: colorForAction(index),
-                            width: `${Math.max(6, row.freqs[index] * 100)}%`,
-                          }}
-                        >
-                          {Math.round(row.freqs[index] * 100)}%
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+          <section className="mt-4 overflow-hidden rounded border border-white/10 bg-[#1d1e21]">
+            <div className="flex items-center gap-1 border-b border-white/10 bg-black/20 px-2 pt-2 text-sm">
+              {DETAIL_TABS.map(({ id, label }) => (
+                <button
+                  className={
+                    detailTab === id
+                      ? "rounded-t bg-[#25262a] px-3 py-2 font-medium text-zinc-100"
+                      : "rounded-t px-3 py-2 text-zinc-500 hover:bg-white/6 hover:text-zinc-300"
+                  }
+                  key={id}
+                  onClick={() => setDetailTab(id)}
+                  type="button"
+                >
+                  {label}
+                </button>
               ))}
+            </div>
+
+            <div className="p-3">
+              {detailTab === "hands" && (
+                <>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-sm font-semibold">
+                        {activeHandLabel ? `${activeHandLabel} Combos` : "Combo Inspector"}
+                      </h2>
+                      <p className="text-xs text-zinc-500">
+                        {activeHandLabel
+                          ? "Hover another matrix cell to inspect its exact suits."
+                          : "Hover a hand in the strategy grid to inspect exact combos."}
+                      </p>
+                    </div>
+                    {activeComboRows.length > 0 && (
+                      <span className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-400">
+                        {activeComboRows.length} combo{activeComboRows.length === 1 ? "" : "s"}
+                      </span>
+                    )}
+                  </div>
+
+                  {activeComboRows.length === 0 ? (
+                    <p className="rounded bg-[#25262a] p-3 text-sm text-zinc-500">
+                      Solve the current spot, then hover the matrix to populate combo frequencies.
+                    </p>
+                  ) : (
+                    <div className="grid max-h-72 grid-cols-2 gap-1 overflow-y-auto pr-1">
+                      {activeComboRows.map((row) => {
+                        const tileBackground = comboStrategyGradient(row.freqs, actions);
+
+                        return (
+                          <div
+                            className="min-h-36 rounded-sm border border-black/35 p-2 text-sm text-white shadow-inner shadow-white/10"
+                            key={row.handIndex}
+                            style={{ background: tileBackground }}
+                          >
+                            <div className="mb-5 flex items-start justify-between">
+                              <div className="flex items-center gap-1">
+                                {[row.cardA, row.cardB].map((card) => (
+                                  <PlayingCard
+                                    card={card}
+                                    className="w-8 rounded shadow-sm shadow-black/20"
+                                    key={card}
+                                    tone="zinc"
+                                  />
+                                ))}
+                              </div>
+                              <span className="font-mono text-sm text-black/70">%</span>
+                            </div>
+
+                            <div className="space-y-0.5 text-black/75">
+                              {actions.map((action, index) => (
+                                <div className="grid grid-cols-[1fr_auto] gap-2 leading-5" key={action}>
+                                  <span>{formatAction(action)}</span>
+                                  <span className="font-mono">{formatStrategyPercent(row.freqs[index] ?? 0)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {detailTab === "summary" && (
+                <ComingSoonPanel
+                  compact
+                  description="Aggregated stats for the hovered hand class and current node."
+                  title="Summary"
+                />
+              )}
+
+              {detailTab === "filters" && (
+                <ComingSoonPanel
+                  compact
+                  description="Filter combos by suit, strength, and action frequency."
+                  title="Filters"
+                />
+              )}
+
+              {detailTab === "blockers" && (
+                <ComingSoonPanel
+                  compact
+                  description="Blocker effects on villain range and board interaction."
+                  title="Blockers"
+                />
+              )}
             </div>
           </section>
 
@@ -1588,6 +2424,46 @@ export default function SolvePage() {
           </section>
         </aside>
       </div>
+
+      {DEV_SOLVE_FIXTURES_ENABLED && devFixturesOpen && (
+        <Modal title="Load dev fixture" onClose={() => setDevFixturesOpen(false)}>
+          <div className="space-y-3">
+            <div>
+              <h3 className="text-sm font-semibold">Pre-solved development spots</h3>
+              <p className="mt-1 text-xs text-zinc-500">
+                These JSON fixtures hydrate the UI instantly. They include root and shallow action-path nodes only.
+              </p>
+            </div>
+            <div className="space-y-2">
+              {devFixtures.map((fixture) => (
+                <button
+                  className="block w-full rounded border border-white/10 bg-[#222326] p-3 text-left hover:border-amber-200/60 hover:bg-[#2a2923]"
+                  key={fixture.id}
+                  onClick={() => loadDevFixture(fixture)}
+                  type="button"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-zinc-100">{fixture.label}</div>
+                      <div className="mt-1 text-xs text-zinc-500">{fixture.description}</div>
+                    </div>
+                    <span className="shrink-0 rounded bg-black/20 px-2 py-1 text-[10px] text-zinc-400">
+                      {fixture.nodes.length} nodes
+                    </span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-zinc-500">
+                    <span className="rounded bg-black/20 px-2 py-1">{fixture.boardSlots.join(" ")}</span>
+                    <span className="rounded bg-black/20 px-2 py-1">{fixture.maxIterations} iterations</span>
+                    <span className="rounded bg-black/20 px-2 py-1">
+                      Expl {fixture.progress.exploitability.toFixed(2)}
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {spotPresetOpen && (
         <Modal title="Configure spot preset" onClose={() => setSpotPresetOpen(false)}>
@@ -1898,12 +2774,7 @@ export default function SolvePage() {
               <div className="text-xs text-zinc-500">Board</div>
               <div className="mt-2 flex flex-wrap gap-2">
                 {boardCards.map((card) => (
-                  <span
-                    className="rounded bg-black/30 px-3 py-2 text-base font-semibold"
-                    key={card}
-                  >
-                    {cardFace(card)}
-                  </span>
+                  <PlayingCard card={card} className="w-12 rounded-lg p-1 shadow-black/15" key={card} tone="zinc" />
                 ))}
               </div>
             </div>
@@ -1916,199 +2787,6 @@ export default function SolvePage() {
                   </span>
                 ))}
               </div>
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      {nodeLockOpen && results && (
-        <Modal title="Nodelock current node" onClose={() => setNodeLockOpen(false)}>
-          <div className="space-y-4">
-            <div className="rounded border border-sky-300/30 bg-[#10242c] p-3">
-              <div className="text-sm font-semibold text-sky-100">
-                Lock {actingPlayer}&apos;s strategy at this node
-              </div>
-              <p className="mt-1 text-xs text-zinc-400">
-                Check the lock on, choose an action brush, then paint hands in the matrix or use
-                combo checkboxes. The lock is applied before a fresh solve starts.
-              </p>
-            </div>
-
-            <label className="flex items-center gap-2 rounded border border-white/10 bg-[#222326] px-3 py-2 text-sm">
-              <input
-                checked={nodeLockEnabled}
-                className="accent-sky-300"
-                onChange={(event) => setNodeLockEnabled(event.target.checked)}
-                type="checkbox"
-              />
-              Enable nodelock painting
-            </label>
-
-            <div className="rounded border border-white/10 bg-[#222326] p-3">
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <h3 className="text-sm font-semibold">Paintbrush</h3>
-                <span className="text-xs text-zinc-500">
-                  {lockedHandCount} combo{lockedHandCount === 1 ? "" : "s"} painted
-                </span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {actions.map((action, index) => (
-                  <button
-                    className={
-                      index === nodeLockBrushAction
-                        ? "rounded bg-sky-300 px-3 py-1.5 text-sm font-semibold text-black"
-                        : "rounded bg-white/8 px-3 py-1.5 text-sm text-zinc-200 hover:bg-white/12"
-                    }
-                    key={action}
-                    onClick={() => setNodeLockBrushAction(index)}
-                    type="button"
-                  >
-                    Paint {formatAction(action)}
-                  </button>
-                ))}
-                <button
-                  className="rounded bg-white/8 px-3 py-1.5 text-sm text-zinc-200 hover:bg-white/12"
-                  onClick={() => setNodeLockHands({})}
-                  type="button"
-                >
-                  Clear paint
-                </button>
-              </div>
-            </div>
-
-            <div className="rounded border border-white/10 bg-[#222326] p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-sm font-semibold">Paint hand classes</h3>
-                <span className="text-xs text-zinc-500">Click cells to lock them</span>
-              </div>
-              <div
-                className="grid overflow-hidden rounded border border-black/70 bg-black/40"
-                style={{ gridTemplateColumns: "repeat(13, minmax(0, 1fr))" }}
-              >
-                {matrix.map((cell) => {
-                  const handIndices = results ? handClassIndices(results, cell.label) : [];
-                  const paintedCount = handIndices.filter((hand) => nodeLockHands[hand]).length;
-                  const painted = paintedCount > 0;
-
-                  return (
-                    <button
-                      className={
-                        painted
-                          ? "min-h-10 border-b border-r border-black/60 bg-sky-300 p-1 text-left text-black"
-                          : cell.comboCount > 0
-                            ? "min-h-10 border-b border-r border-black/60 bg-[#303136] p-1 text-left text-zinc-100 hover:bg-[#3b3d43]"
-                            : "min-h-10 border-b border-r border-black/60 bg-[#222326] p-1 text-left text-zinc-700"
-                      }
-                      disabled={!nodeLockEnabled || cell.comboCount === 0}
-                      key={cell.label}
-                      onClick={() => paintHandClass(cell.label)}
-                      type="button"
-                    >
-                      <div className="text-xs font-semibold">{cell.label}</div>
-                      {painted && (
-                        <div className="text-[10px]">
-                          {formatAction(actions[nodeLockBrushAction] ?? actions[0])}
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="rounded border border-white/10 bg-[#222326] p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-sm font-semibold">Combo checkboxes</h3>
-                <span className="text-xs text-zinc-500">First {lockPreviewRows.length} combos</span>
-              </div>
-              <div className="max-h-56 space-y-1 overflow-y-auto pr-1">
-                {lockPreviewRows.map((row) => {
-                  const locked = Boolean(nodeLockHands[row.handIndex]);
-                  const lockedActionIndex = locked
-                    ? nodeLockHands[row.handIndex].findIndex((freq) => freq > 0)
-                    : nodeLockBrushAction;
-
-                  return (
-                    <div
-                      className="grid grid-cols-[24px_70px_1fr] items-center gap-2 rounded bg-black/20 px-2 py-1.5"
-                      key={`${row.cards}-${row.label}`}
-                    >
-                      <input
-                        checked={locked}
-                        className="accent-sky-300"
-                        onChange={(event) => toggleComboLock(row.handIndex, event.target.checked)}
-                        type="checkbox"
-                      />
-                      <div>
-                        <div className="font-mono text-xs">{row.cards}</div>
-                        <div className="text-[10px] text-zinc-500">{row.label}</div>
-                      </div>
-                      <div className="flex flex-wrap gap-1">
-                        {actions.map((action, index) => (
-                          <button
-                            className={
-                              locked && lockedActionIndex === index
-                                ? "rounded bg-sky-300 px-2 py-1 text-[10px] font-semibold text-black"
-                                : "rounded bg-white/8 px-2 py-1 text-[10px] text-zinc-300 hover:bg-white/12"
-                            }
-                            key={action}
-                            onClick={() => {
-                              setNodeLockBrushAction(index);
-                              setNodeLockHands((current) => ({
-                                ...current,
-                                [row.handIndex]: oneHotStrategy(results.numActions, index),
-                              }));
-                            }}
-                            type="button"
-                          >
-                            {formatAction(action)}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {actions.map((action, index) => (
-                <button
-                  className="rounded bg-white/8 px-3 py-1.5 text-sm text-zinc-200 hover:bg-white/12"
-                  key={action}
-                  onClick={() => {
-                    const next: Record<number, number[]> = {};
-                    const actionStrategy = oneHotStrategy(results.numActions, index);
-                    const numHands = Math.floor(results.privateCards.length / 2);
-                    for (let hand = 0; hand < numHands; hand++) {
-                      next[hand] = actionStrategy;
-                    }
-                    setNodeLockBrushAction(index);
-                    setNodeLockHands(next);
-                  }}
-                  type="button"
-                >
-                  Paint all {formatAction(action)}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex justify-end gap-2">
-              <button
-                className="rounded bg-white/8 px-4 py-2 text-sm font-semibold text-zinc-200 hover:bg-white/12"
-                onClick={() => setNodeLockOpen(false)}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button
-                className="rounded bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200"
-                disabled={!nodeLockEnabled || lockedHandCount === 0}
-                onClick={applyNodeLock}
-                type="button"
-              >
-                Apply and re-solve
-              </button>
             </div>
           </div>
         </Modal>

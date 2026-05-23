@@ -1,11 +1,16 @@
 import type { Metadata } from "next";
-import { Geist } from "next/font/google";
+import { DM_Sans, Geist } from "next/font/google";
 import { Agentation } from "agentation";
 import "./globals.css";
 
 const geist = Geist({
   subsets: ["latin"],
   variable: "--font-geist",
+});
+
+const dmSans = DM_Sans({
+  subsets: ["latin"],
+  variable: "--font-dm-sans",
 });
 
 export const metadata: Metadata = {
@@ -20,7 +25,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="h-full">
-      <body className={`${geist.variable} min-h-full`}>
+      <body className={`${geist.variable} ${dmSans.variable} min-h-full`}>
         {children}
         {process.env.NODE_ENV === "development" && <Agentation />}
       </body>
