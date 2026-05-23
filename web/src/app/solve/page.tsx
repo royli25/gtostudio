@@ -282,9 +282,6 @@ function validateSolveConfig(config: SolverConfig, boardSlots: string[]): string
   if (boardSlots.slice(0, 3).some((card) => !card)) {
     errors.push("Choose all three flop cards before solving.");
   }
-  if (boardSlots[4] && !boardSlots[3]) {
-    errors.push("Choose a turn card before choosing a river card.");
-  }
   if (!Number.isFinite(config.startingPot) || config.startingPot <= 0) {
     errors.push("Pot must be greater than 0.");
   }
@@ -585,21 +582,21 @@ export default function SolvePage() {
   const [nodeLockStrategy, setNodeLockStrategy] = useState<number[] | null>(null);
   const [nodeOpen, setNodeOpen] = useState(false);
 
-  const [gameType, setGameType] = useState<GameType>("Heads-up");
-  const [heroPosition, setHeroPosition] = useState("SB");
-  const [villainPosition, setVillainPosition] = useState("BB");
+  const [gameType, setGameType] = useState<GameType>("6-max");
+  const [heroPosition, setHeroPosition] = useState("UTG");
+  const [villainPosition, setVillainPosition] = useState("BTN");
   const [potType, setPotType] = useState<PotType>("Single raised pot");
-  const initialPreset = buildPresetRanges("Heads-up", "SB", "BB", "Single raised pot");
+  const initialPreset = buildPresetRanges("6-max", "UTG", "BTN", "Single raised pot");
   const initialBaseline = buildBaselineActionConfig("Single raised pot");
   const [oopRange, setOopRange] = useState(initialPreset.oopRange);
   const [ipRange, setIpRange] = useState(initialPreset.ipRange);
-  const [boardSlots, setBoardSlots] = useState(["Qs", "Jh", "2h", "", ""]);
+  const [boardSlots, setBoardSlots] = useState(["Qs", "Jh", "2h"]);
   const [activeBoardSlot, setActiveBoardSlot] = useState<number | null>(null);
   const [activeCardRank, setActiveCardRank] = useState("A");
   const [startingPot, setStartingPot] = useState(180);
   const [effectiveStack, setEffectiveStack] = useState(910);
   const [maxIterations, setMaxIterations] = useState(200);
-  const [targetExpl, setTargetExpl] = useState(0.5);
+  const [targetExpl, setTargetExpl] = useState(0.1);
   const [actionConfig, setActionConfig] = useState<Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey>>(initialBaseline);
 
   const actions = useMemo(() => splitActions(results?.actions ?? "Check, Bet(94)"), [results]);
@@ -627,7 +624,7 @@ export default function SolvePage() {
   const { ipPosition, oopPosition } = presetRanges;
   const actingPlayer = results?.player?.toUpperCase() ?? "OOP";
   const actingSeat = results?.player === "oop" ? oopPosition : results?.player === "ip" ? ipPosition : "Chance";
-  const currentStreet = streetName(boardCards.length);
+  const currentStreet = streetName(results?.currentBoard.length ?? boardCards.length);
   const finalExploitability = progress?.exploitability ?? 0;
   const exploitabilityPct = startingPot > 0 ? (finalExploitability / startingPot) * 100 : 0;
   const lockedHandCount = Object.keys(nodeLockHands).length;
@@ -1028,7 +1025,7 @@ export default function SolvePage() {
             <div className="flex items-center justify-between">
               <div>
                 <h1 className="text-lg font-semibold">Configure Spot</h1>
-                <p className="text-xs text-zinc-500">Heads-up postflop tree</p>
+                <p className="text-xs text-zinc-500">{gameType} postflop tree</p>
               </div>
               <span className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-400">300bb</span>
             </div>
@@ -1068,12 +1065,12 @@ export default function SolvePage() {
             <div>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-zinc-400">Board</span>
-                <span className="text-xs text-zinc-500">Flop · Turn · River</span>
+                <span className="text-xs text-zinc-500">Flop only</span>
               </div>
-              <div className="grid grid-cols-5 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 {boardSlots.map((card, index) => {
                   const active = activeBoardSlot === index;
-                  const label = index < 3 ? `Flop ${index + 1}` : index === 3 ? "Turn" : "River";
+                  const label = `Flop ${index + 1}`;
 
                   return (
                     <button
@@ -1101,7 +1098,7 @@ export default function SolvePage() {
                     <div>
                       <div className="text-sm font-semibold">Choose card</div>
                       <div className="text-xs text-zinc-500">
-                        {activeBoardSlot < 3 ? `Flop card ${activeBoardSlot + 1}` : activeBoardSlot === 3 ? "Turn" : "River"}
+                        Flop card {activeBoardSlot + 1}
                       </div>
                     </div>
                     <div className="flex gap-2">
@@ -1387,6 +1384,31 @@ export default function SolvePage() {
                   </div>
                 );
               })}
+              {results?.isChance && (
+                <div className="min-h-28 min-w-64 rounded border border-amber-300/70 bg-amber-300/10 px-3 py-2 text-xs text-zinc-200">
+                  <div className="mb-2">
+                    <div className="font-semibold text-amber-100">
+                      {streetForBoardLength(results.currentBoard.length + 1)}
+                    </div>
+                    <div className="text-zinc-500">
+                      Choose {results.currentBoard.length === 3 ? "turn" : "river"} card
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1">
+                    {results.possibleCards.map((card) => (
+                      <button
+                        className="rounded bg-[#25262a] px-2 py-2 font-mono text-xs text-zinc-100 hover:bg-amber-300/20 disabled:opacity-50"
+                        disabled={solving || nodeLoading}
+                        key={card}
+                        onClick={() => navigateChanceCard(card)}
+                        type="button"
+                      >
+                        {cardLabelFromId(card)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               {results && !results.isChance && !results.isTerminal && (
                 <div className="min-h-28 min-w-36 rounded border border-amber-300/70 bg-amber-300/10 px-3 py-2 text-xs text-zinc-200">
                   <div className="mb-2 font-semibold text-amber-100">{actingSeat}</div>
@@ -1480,23 +1502,8 @@ export default function SolvePage() {
               )}
 
               {results?.isChance && (
-                <div>
-                  <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                    Choose {results.currentBoard.length === 3 ? "turn" : "river"} card
-                  </div>
-                  <div className="grid grid-cols-4 gap-1">
-                    {results.possibleCards.map((card) => (
-                      <button
-                        className="rounded bg-[#25262a] px-2 py-2 font-mono text-xs text-zinc-100 hover:bg-[#31333a] disabled:opacity-50"
-                        disabled={solving || nodeLoading}
-                        key={card}
-                        onClick={() => navigateChanceCard(card)}
-                        type="button"
-                      >
-                        {cardLabelFromId(card)}
-                      </button>
-                    ))}
-                  </div>
+                <div className="rounded bg-[#25262a] p-3 text-sm text-zinc-400">
+                  Choose the next board card in the action path.
                 </div>
               )}
 
