@@ -687,6 +687,12 @@ function FullScreenMessage({ message, sub }: { message: string; sub?: string }) 
       <div className="rounded border border-white/10 bg-[#161719] p-6 text-center">
         <div className="text-sm text-zinc-400">{message}</div>
         {sub && <div className="mt-2 text-xs text-zinc-600">{sub}</div>}
+        <Link
+          href="/solve"
+          className="mt-4 inline-block text-xs text-zinc-500 hover:text-zinc-300"
+        >
+          ← Back to Solve
+        </Link>
       </div>
     </main>
   );
@@ -698,13 +704,21 @@ function ErrorScreen({ message, onRetry }: { message: string; onRetry: () => voi
       <div className="max-w-md rounded border border-red-500/30 bg-[#1a1214] p-6 text-center">
         <div className="mb-2 text-sm font-semibold text-red-300">Error</div>
         <div className="text-sm text-zinc-400">{message}</div>
-        <button
-          className="mt-4 rounded bg-white/8 px-4 py-2 text-sm text-zinc-200 hover:bg-white/12"
-          onClick={onRetry}
-          type="button"
-        >
-          Retry
-        </button>
+        <div className="mt-4 flex items-center justify-center gap-3">
+          <Link
+            href="/solve"
+            className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-500"
+          >
+            Go to Solve
+          </Link>
+          <button
+            className="rounded bg-white/8 px-4 py-2 text-sm text-zinc-200 hover:bg-white/12"
+            onClick={onRetry}
+            type="button"
+          >
+            Retry
+          </button>
+        </div>
       </div>
     </main>
   );

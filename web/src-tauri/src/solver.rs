@@ -15,6 +15,16 @@ const FORCE_UNCOMPRESSED_LIMIT_MB: f64 = 12288.0;
 pub struct SolverState {
     game: Mutex<Option<PostFlopGame>>,
     cancel_requested: AtomicBool,
+    solving: AtomicBool,
+    last_result: Mutex<Option<SolveDone>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SolverStatus {
+    pub initialized: bool,
+    pub solving: bool,
+    pub last_result: Option<SolveDone>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,7 +80,7 @@ pub struct ProgressEvent {
     phase: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SolveDone {
     exploitability: f32,
@@ -258,6 +268,8 @@ fn solver_solve_blocking(
 ) -> Result<SolveDone, String> {
     let started = Instant::now();
     state.cancel_requested.store(false, Ordering::SeqCst);
+    state.solving.store(true, Ordering::SeqCst);
+    *state.last_result.lock().unwrap() = None;
     emit_log(
         &app,
         format!(
@@ -345,10 +357,30 @@ fn solver_solve_blocking(
         ),
     );
 
-    Ok(SolveDone {
+    let done = SolveDone {
         exploitability: last_exploitability,
         cancelled,
-    })
+    };
+    *state.last_result.lock().unwrap() = Some(done.clone());
+    state.solving.store(false, Ordering::SeqCst);
+    Ok(done)
+}
+
+#[tauri::command]
+pub fn solver_status(state: State<'_, SolverState>) -> SolverStatus {
+    // Use try_lock so we never block the main thread if extractTree holds the game lock
+    let initialized = state
+        .game
+        .try_lock()
+        .map(|g| g.is_some())
+        .unwrap_or(true); // assume initialized if lock is held (something is using the game)
+    let solving = state.solving.load(Ordering::SeqCst);
+    let last_result = state.last_result.lock().ok().and_then(|g| g.clone());
+    SolverStatus {
+        initialized,
+        solving,
+        last_result,
+    }
 }
 
 #[tauri::command]
@@ -362,7 +394,7 @@ pub fn solver_get_results(
     state: State<'_, SolverState>,
     history: Vec<usize>,
 ) -> Result<SolveResults, String> {
-    with_game(state.inner(), |game| {
+    try_with_game(state.inner(), |game| {
         apply_history(game, &history);
 
         let player = current_player(game);
@@ -563,6 +595,20 @@ fn with_game<T>(
         .game
         .lock()
         .map_err(|_| "Solver lock poisoned".to_string())?;
+    let game = guard
+        .as_mut()
+        .ok_or_else(|| "Game not initialized".to_string())?;
+    f(game)
+}
+
+fn try_with_game<T>(
+    state: &SolverState,
+    f: impl FnOnce(&mut PostFlopGame) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = state
+        .game
+        .try_lock()
+        .map_err(|_| "Solver is busy".to_string())?;
     let game = guard
         .as_mut()
         .ok_or_else(|| "Game not initialized".to_string())?;

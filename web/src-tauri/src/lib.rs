@@ -16,6 +16,7 @@ pub fn run() {
             solver::solver_lock_current_node,
             solver::solver_save_local_metadata,
             solver::solver_solve,
+            solver::solver_status,
             solver::solver_unlock_current_node,
         ])
         .run(tauri::generate_context!())

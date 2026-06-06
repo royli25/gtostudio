@@ -48,6 +48,12 @@ export interface SolveDone {
   exploitability: number;
 }
 
+export interface SolverStatus {
+  initialized: boolean;
+  solving: boolean;
+  lastResult: SolveDone | null;
+}
+
 export interface LocalSolveMetadata {
   fileName: string;
   metadata: unknown;
@@ -148,6 +154,10 @@ export class DesktopSolverClient {
 
   async extractTree(): Promise<SolveResults[]> {
     return invoke<SolveResults[]>("solver_extract_tree");
+  }
+
+  async status(): Promise<SolverStatus> {
+    return invoke<SolverStatus>("solver_status");
   }
 
   async dispose() {
