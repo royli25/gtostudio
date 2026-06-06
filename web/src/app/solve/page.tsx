@@ -7,8 +7,6 @@ import { createPortal } from "react-dom";
 import type { MouseEvent, ReactNode, RefObject } from "react";
 import { DesktopSolverClient, type SolverConfig, type StorageMode } from "@/lib/desktop-solver";
 import type { ComboRow, SolveResults } from "@/lib/poker";
-import { saveSpotToCloud } from "@/lib/solved-spots";
-import { uploadTree } from "@/lib/tree-storage";
 
 interface SolveLog {
   time: string;
@@ -1204,9 +1202,6 @@ export default function SolvePage() {
   const [centerView, setCenterView] = useState<CenterView>("strategy");
   const [detailTab, setDetailTab] = useState<DetailTab>("hands");
   const [rightLockTab, setRightLockTab] = useState<RightLockTab>("strategy");
-  const [cloudSaveStatus, setCloudSaveStatus] = useState<"idle" | "saving" | "done" | "error">("idle");
-  const [cloudSaveError, setCloudSaveError] = useState<string | null>(null);
-
   const [gameType, setGameType] = useState<GameType>("6-max");
   const [heroPosition, setHeroPosition] = useState("UTG");
   const [villainPosition, setVillainPosition] = useState("BTN");
@@ -1412,65 +1407,43 @@ export default function SolvePage() {
     };
   }, [addLog, fixtureMode?.id, loadDevFixture]);
 
-  // Reconnect to solver on mount — if a solve finished while we were on another page,
-  // restore the results so the user sees the solved state.
+  // Restore solver state on mount
   useEffect(() => {
-    if (results || solving || fixtureMode) return; // already have state
+    if (results || solving || fixtureMode) return;
     let cancelled = false;
 
-    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-    const reconnect = async () => {
+    const restore = async () => {
       try {
         const client = new DesktopSolverClient();
         const status = await client.status();
-
         if (cancelled) return;
 
-        if (status.initialized && status.lastResult && !status.lastResult.cancelled && !status.solving) {
-          // Solver has a completed solve — restore results
-          addLog("Reconnecting to existing solved game...");
+        const phase = status.phase;
+        if (phase.type === "done") {
+          // Solver finished — restore results
           solverRef.current = client;
-          await client.listen({
-            onError: (message) => addLog(`ERROR: ${message}`),
-            onLog: addLog,
-            onMemoryAllocated: () => {},
-            onProgress: () => {},
-          });
-
-          // The game mutex might still be held by a cloud upload in progress.
-          // Retry getResults with backoff instead of blocking forever.
-          let rootResults: SolveResults | null = null;
-          for (let attempt = 0; attempt < 20 && !cancelled; attempt++) {
-            try {
-              rootResults = await client.getResults([]);
-              break;
-            } catch {
-              if (attempt < 19) {
-                addLog(`Waiting for solver lock... (attempt ${attempt + 1})`);
-                await delay(500);
-              }
-            }
-          }
-
-          if (cancelled || !rootResults) return;
+          const rootResults = await client.getResults([]);
+          if (cancelled) return;
           setResults(rootResults);
           setCurrentHistory([]);
           setProgress({
-            exploitability: status.lastResult.exploitability,
+            exploitability: phase.exploitability,
             iteration: 0,
             phase: "exploitability",
           });
-          addLog(`Restored solve. Exploitability = ${status.lastResult.exploitability.toFixed(4)}`);
-        } else if (status.solving) {
-          // Solve is still in progress — reconnect event listeners and wait
-          addLog("Solve in progress — reconnecting...");
+          addLog(`Restored solve. Exploitability = ${phase.exploitability.toFixed(4)}`);
+        } else if (phase.type === "solving") {
+          // Solve in progress — subscribe to events
           solverRef.current = client;
           setSolving(true);
+          setProgress({
+            iteration: phase.iteration,
+            exploitability: phase.exploitability,
+            phase: "iterationComplete",
+          });
           await client.listen({
             onError: (message) => addLog(`ERROR: ${message}`),
             onLog: addLog,
-            onMemoryAllocated: () => {},
             onProgress: (point) => {
               setProgress((current) => ({
                 exploitability: point.exploitability ?? current?.exploitability ?? null,
@@ -1478,16 +1451,88 @@ export default function SolvePage() {
                 phase: point.phase,
               }));
             },
+            onDone: async (result) => {
+              setSolving(false);
+              try {
+                const rootResults = await client.getResults([]);
+                setResults(rootResults);
+                setCurrentHistory([]);
+              } catch {
+                addLog("Failed to get results after solve completed");
+              }
+            },
           });
         }
       } catch {
-        // Solver not available (e.g. running in browser without Tauri)
+        // Not in Tauri environment
       }
     };
 
-    reconnect();
+    restore();
     return () => { cancelled = true; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Track whether config has been restored from Rust (prevents persist from overwriting on mount)
+  const configRestoredRef = useRef(false);
+
+  // Restore UI config on mount
+  useEffect(() => {
+    const restoreConfig = async () => {
+      try {
+        const client = new DesktopSolverClient();
+        const config = await client.getConfig();
+        if (!config) {
+          configRestoredRef.current = true;
+          return;
+        }
+
+        // Restore all UI state from persisted config
+        if (config.board?.length) setBoardSlots(config.board);
+        if (config.oopRange) setOopRange(config.oopRange);
+        if (config.ipRange) setIpRange(config.ipRange);
+        if (config.oopPosition) setHeroPosition(config.oopPosition);
+        if (config.ipPosition) setVillainPosition(config.ipPosition);
+        if (config.gameType) setGameType(config.gameType as GameType);
+        if (config.potType) setPotType(config.potType as PotType);
+        if (config.startingPot) setStartingPot(config.startingPot);
+        if (config.effectiveStack) setEffectiveStack(config.effectiveStack);
+        if (config.maxIterations) setMaxIterations(config.maxIterations);
+        if (config.targetExploitability) setTargetExpl(config.targetExploitability);
+      } catch {
+        // Not in Tauri environment or no saved config
+      } finally {
+        configRestoredRef.current = true;
+      }
+    };
+    restoreConfig();
+  }, []);
+
+  // Persist config to Rust on changes (only after initial restore completes)
+  useEffect(() => {
+    if (!configRestoredRef.current) return;
+    const saveConfig = async () => {
+      try {
+        const client = new DesktopSolverClient();
+        await client.setConfig({
+          board: boardSlots.filter(Boolean),
+          oopRange,
+          ipRange,
+          oopPosition: heroPosition,
+          ipPosition: villainPosition,
+          gameType,
+          potType,
+          startingPot,
+          effectiveStack,
+          treeConfig: actionConfig as Record<string, unknown>,
+          maxIterations,
+          targetExploitability: targetExpl,
+        });
+      } catch {
+        // ignore
+      }
+    };
+    saveConfig();
+  }, [boardSlots, oopRange, ipRange, heroPosition, villainPosition, gameType, potType, startingPot, effectiveStack, maxIterations, targetExpl, actionConfig]);
 
   const applySpotPreset = useCallback((
     nextGameType: GameType,
@@ -1697,8 +1742,6 @@ export default function SolvePage() {
     setNodeLoading(false);
     setResults(null);
     setProgress(null);
-    setCloudSaveStatus("idle");
-    setCloudSaveError(null);
     setCurrentHistory(solveHistory);
     if (!activeLock) {
       setPathSegments([]);
@@ -1730,6 +1773,35 @@ export default function SolvePage() {
             addLog(`Iteration ${point.iteration}: exploitability = ${point.exploitability.toFixed(4)}`);
           }
         },
+        onDone: async (result) => {
+          setSolving(false);
+          if (activeLock) {
+            setNodeLockEnabled(false);
+          }
+          setProgress({
+            exploitability: result.exploitability,
+            iteration: maxIterations,
+            phase: "exploitability",
+          });
+          try {
+            const rootResults = await solver.getResults(solveHistory);
+            setResults(rootResults);
+            setCurrentHistory(rootResults.history ?? []);
+            addLog(`Solve complete. Exploitability = ${result.exploitability.toFixed(4)}`);
+          } catch (e) {
+            addLog(`Error getting results: ${e}`);
+          }
+        },
+        onExtracting: () => {
+          addLog("Extracting solved tree...");
+        },
+        onUploading: () => {
+          addLog("Uploading to cloud...");
+        },
+        onSolverError: (error) => {
+          setSolving(false);
+          addLog(`Solver error in ${error.phase}: ${error.message}`);
+        },
       });
 
       addLog("UI: sending config to native Rust solver.");
@@ -1745,96 +1817,29 @@ export default function SolvePage() {
 
       addLog(`UI: starting native solve for ${maxIterations} iterations.`);
       await waitForPaint();
-      const done = await solver.solve(
+
+      // Fire-and-forget start — Rust handles solve → extract → upload pipeline
+      await solver.start({
         maxIterations,
-        (startingPot * targetExpl) / 100,
-        PROGRESS_MODES[progressMode].interval
-      );
-      addLog("UI: native solve command returned.");
-      setProgress((current) => ({
-        exploitability: done.exploitability,
-        iteration: current?.iteration ?? maxIterations,
-        phase: "exploitability",
-      }));
-
-      if (done.cancelled) {
-        addLog(`Solve cancelled. Last exploitability = ${done.exploitability.toFixed(4)}`);
-        setSolving(false);
-        return;
-      }
-
-      addLog(`Solve complete. Final exploitability = ${done.exploitability.toFixed(4)}`);
-      setNodeLoading(true);
-      addLog("UI: requesting root results from native solver.");
-      const nextResults = await solver.getResults(solveHistory);
-      setResults(nextResults);
-      setCurrentHistory(nextResults.history ?? []);
-      setNodeLoading(false);
-      addLog(`${nextResults.history?.length ? "Selected" : "Root"} node player: ${nextResults.player}`);
-      addLog(`OOP EV = ${nextResults.rootEvOop.toFixed(4)}; equity = ${nextResults.rootEqOop.toFixed(5)}`);
-
-      if (activeLock) {
-        setNodeLockEnabled(false);
-        addLog("Nodelock applied. Returned to study mode.");
-      }
-
-      // Auto-save to cloud after successful solve
-      if (!activeLock) {
-        try {
-          setCloudSaveStatus("saving");
-          addLog("UI: auto-saving to cloud — extracting full game tree...");
-          const nodes = await solver.extractTree();
-          addLog(`Extracted ${nodes.length} decision nodes.`);
-
-          addLog("UI: saving spot config to cloud...");
-          const spot = await saveSpotToCloud({
-            board: boardSlots.join(" "),
-            config: solverConfig,
-            exploitability: done.exploitability,
-            gameType,
-            ipPosition: villainPosition,
-            iterations: maxIterations,
-            memoryUsageMb: 0,
-            oopPosition: heroPosition,
-            potType,
-            solveTimeMs: 0,
-          });
-          addLog(`Spot saved with id: ${spot.id}`);
-
-          addLog("UI: compressing and uploading tree to Supabase Storage...");
-          const upload = await uploadTree(spot.id, nodes);
-          addLog(`Tree uploaded: ${(upload.compressedBytes / 1024 / 1024).toFixed(1)} MB compressed (${(upload.sizeBytes / 1024 / 1024).toFixed(1)} MB raw)`);
-
-          await saveSpotToCloud({
-            board: boardSlots.join(" "),
-            config: solverConfig,
-            exploitability: done.exploitability,
-            gameType,
-            ipPosition: villainPosition,
-            iterations: maxIterations,
-            memoryUsageMb: 0,
-            oopPosition: heroPosition,
-            potType,
-            solveTimeMs: 0,
-            treePath: upload.path,
-          });
-
-          addLog("Cloud save complete!");
-          setCloudSaveStatus("done");
-        } catch (cloudErr) {
-          const msg = cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
-          addLog(`Cloud save error: ${msg}`);
-          setCloudSaveError(msg);
-          setCloudSaveStatus("error");
-        }
-      }
+        targetExploitability: (startingPot * targetExpl) / 100,
+        exploitabilityInterval: PROGRESS_MODES[progressMode].interval,
+        supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
+        supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+        spotMetadata: {
+          board: boardSlots.filter(Boolean).join(" "),
+          config: solverConfig,
+          gameType,
+          potType,
+          oopPosition: heroPosition,
+          ipPosition: villainPosition,
+        },
+      });
     } catch (err) {
       addLog(`Config error: ${err instanceof Error ? err.message : String(err)}`);
       setSolving(false);
       setNodeLoading(false);
       return;
     }
-    setSolving(false);
   }, [
     addLog,
     boardSlots,
@@ -1849,61 +1854,6 @@ export default function SolvePage() {
     villainPosition,
     potType,
   ]);
-
-  const handleSaveToCloud = useCallback(async () => {
-    if (!solverRef.current || !progress) return;
-
-    setCloudSaveStatus("saving");
-    setCloudSaveError(null);
-
-    try {
-      addLog("UI: extracting full game tree...");
-      const nodes = await solverRef.current.extractTree();
-      addLog(`Extracted ${nodes.length} decision nodes.`);
-
-      addLog("UI: saving spot config to cloud...");
-      const spot = await saveSpotToCloud({
-        board: boardSlots.join(" "),
-        config: solverConfig,
-        exploitability: progress.exploitability ?? 0,
-        gameType,
-        ipPosition: villainPosition,
-        iterations: progress.iteration,
-        memoryUsageMb: 0,
-        oopPosition: heroPosition,
-        potType,
-        solveTimeMs: 0,
-      });
-      addLog(`Spot saved with id: ${spot.id}`);
-
-      addLog("UI: compressing and uploading tree to Supabase Storage...");
-      const upload = await uploadTree(spot.id, nodes);
-      addLog(`Tree uploaded: ${(upload.compressedBytes / 1024 / 1024).toFixed(1)} MB compressed (${(upload.sizeBytes / 1024 / 1024).toFixed(1)} MB raw)`);
-
-      // Update spot record with tree path
-      await saveSpotToCloud({
-        board: boardSlots.join(" "),
-        config: solverConfig,
-        exploitability: progress.exploitability ?? 0,
-        gameType,
-        ipPosition: villainPosition,
-        iterations: progress.iteration,
-        memoryUsageMb: 0,
-        oopPosition: heroPosition,
-        potType,
-        solveTimeMs: 0,
-        treePath: upload.path,
-      });
-
-      addLog("Cloud save complete!");
-      setCloudSaveStatus("done");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(`Cloud save error: ${msg}`);
-      setCloudSaveError(msg);
-      setCloudSaveStatus("error");
-    }
-  }, [addLog, boardSlots, gameType, heroPosition, potType, progress, solverConfig, villainPosition]);
 
   const updateNodeLockHands = useCallback((
     updater: Record<number, number[]> | ((current: Record<number, number[]>) => Record<number, number[]>)
@@ -2634,30 +2584,6 @@ export default function SolvePage() {
                 <div className="text-xl font-semibold">40%</div>
               </div>
             </div>
-            {results && !solving && (
-              <div className="mb-4">
-                <button
-                  className={`h-10 w-full rounded font-semibold text-sm transition disabled:opacity-50 disabled:cursor-not-allowed ${
-                    cloudSaveStatus === "done"
-                      ? "bg-emerald-400/20 text-emerald-300 border border-emerald-400/30"
-                      : cloudSaveStatus === "error"
-                        ? "bg-red-400/20 text-red-300 border border-red-400/30"
-                        : "bg-white/8 text-zinc-200 hover:bg-white/12 border border-white/10"
-                  }`}
-                  disabled={cloudSaveStatus === "saving"}
-                  onClick={handleSaveToCloud}
-                  type="button"
-                >
-                  {cloudSaveStatus === "saving" ? "Extracting & uploading..." :
-                   cloudSaveStatus === "done" ? "Saved to cloud" :
-                   cloudSaveStatus === "error" ? "Retry save" :
-                   "Save to Cloud"}
-                </button>
-                {cloudSaveStatus === "error" && cloudSaveError && (
-                  <div className="mt-1 text-xs text-red-400">{cloudSaveError}</div>
-                )}
-              </div>
-            )}
             </>
           )}
 
