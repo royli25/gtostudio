@@ -1,0 +1,109 @@
+\documentclass[10pt, letterpaper]{article}
+
+\usepackage[top=0.55in, bottom=0.55in, left=0.4in, right=0.4in]{geometry}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage{fontenc}
+\usepackage{array}
+\usepackage{tabularx}
+
+\usepackage{xcolor}
+\hypersetup{colorlinks=true, urlcolor=blue, linkcolor=black}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+
+% Section formatting
+\titleformat{\section}{\bfseries\normalsize}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{6pt}{3pt}
+
+% Bullet list settings
+\setlist[itemize]{leftmargin=12pt, itemsep=1pt, parsep=0pt, topsep=2pt, label=\textbullet}
+
+% Two-column job header
+\newcommand{\jobheader}[4]{%
+  \begin{tabularx}{\textwidth}{@{}X r@{}}
+    \textbf{#1} & #2 \\
+    \textit{#3} & #4 \\
+  \end{tabularx}%
+  \vspace{1pt}%
+}
+
+\begin{document}
+
+% ── Header ──────────────────────────────────────────────────────────────────
+{\Large\textbf{Roy Li}} \\[3pt]
+{\small Royli@usc.edu \, | \, Vancouver, BC \& Los Angeles, California \, | \, \href{https://www.linkedin.com/in/roylixyz/}{LinkedIn} \, | \, \href{https://royli.design/}{Design Portfolio}}
+
+% ── Education ───────────────────────────────────────────────────────────────
+\section*{EDUCATION}
+
+\begin{tabularx}{\textwidth}{@{}X r@{}}
+    \textbf{University of Southern California} & Los Angeles, CA \\
+    Computer Science + Arts, Technology, and Business of Innovation & Expected: May 2029 \\
+    \textit{B.S. Human Technology Interactions} & GPA: 3.78/4.00 \\
+  \end{tabularx}%
+  \vspace{1pt}%
+
+\vspace{4pt}
+
+\jobheader{St.\ George's School}{Vancouver, Canada}
+          {GPA: 4.0, AP Program, Graduated Honours with Distinction}{August 2021 -- June 2025}
+
+% ── Experience ──────────────────────────────────────────────────────────────
+\section*{EXPERIENCE}
+
+\jobheader{YG Design Studio}{April 2025 -- June 2025}
+          {Product Developer}{Vancouver, Canada}
+\begin{itemize}
+  \item Worked closely with arts advisors to develop a full-stack student management system for an arts consulting studio, streamlining application tracking and student progress monitoring.
+  \item Tech stack: React, TypeScript, Tailwind CSS, Supabase, shadcn/ui.
+\end{itemize}
+
+\vspace{4pt}
+
+\jobheader{Ripples \& Helen Keller Initiative}{June 2023 -- February 2025}
+          {President \& Project Manager}{Vancouver, Canada}
+\begin{itemize}
+  \item Managed 10 university mentors and 30 students in fundraising for Helen Keller INTL's Vitamin A Fund.
+  \item Raised \$4,600 to fund 2,300 doses of Vitamin A, reducing child mortality by 25\% for students in underprivileged communities.
+\end{itemize}
+
+% ── Projects ────────────────────────────────────────────────────────────────
+\section*{TECHNICAL PROJECTS}
+
+\jobheader{BluePrint -- Education Startup (USC IYA Incubator)}{January 2025 -- November 2025}
+          {Founder, Full-Stack Development, UX Research}{Los Angeles, California}
+\begin{itemize}
+  \item Built a scalable AI pipeline with embeddings, metadata-aware chunking, and vector-DB retrieval for 1,000+ student profiles and 200+ admissions documents.
+  \item Conducted 150+ user interviews with students, parents, counselors, and education consultancies; secured 2 consultancies as design partners to support product development.
+\end{itemize}
+
+\vspace{4pt}
+
+\jobheader{A16z LA Tech Week Hackathon -- Amiya Health (\href{https://youtu.be/vrwiLc0ROXk}{\underline{Demo Video}})}{October 2025}
+          {Full-Stack Development}{Los Angeles, California}
+\begin{itemize}
+  \item Built an AI-powered telehealth platform with 3 developers, enabling seniors to access lifelike virtual doctor consultations via SMS links -- reducing technological friction and giving caregivers real-time peace of mind.
+  \item Designed architecture using React, Supabase, Twilio, GPT-4o-mini, HeyGen, and ElevenLabs for real-time transcription, AI reasoning, and automated medical report generation.
+\end{itemize}
+
+\vspace{4pt}
+
+\jobheader{CalHacks ``Helio Notes'' -- Node Based Note Taking Software (\href{https://youtu.be/m_2NIEZy6Js}{\underline{Demo Video}})}{October 2025}
+          {Full Stack Development}{San Francisco, California}
+\begin{itemize}
+  \item Worked with 3 engineers to build a full-stack knowledge graph system using React Flow that converts live voice conversations into interactive node graphs.
+  \item Streamed Vapi transcriptions via WebSockets to a Node/Express service; used Gemini Pro to generate node relationships and layout coordinates for live React Flow graph updates.
+\end{itemize}
+
+\vspace{4pt}
+
+\jobheader{HackMIT ``Blue'' -- Dyslexic Aid Using Smart Glasses (\href{https://www.youtube.com/watch?v=X4b1lVUkip0}{\underline{Demo Video}})}{September 2025}
+          {Full-Stack Development}{Cambridge, Massachusetts}
+\begin{itemize}
+  \item Led a team of three engineers to research classroom challenges faced by dyslexic students to build Blue, an AI-powered platform on MENTRA OS designed to enhance classroom accessibility.
+\end{itemize}
+
+\end{document}

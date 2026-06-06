@@ -2,9 +2,13 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import type { MouseEvent, ReactNode, RefObject } from "react";
+import { DesktopSolverClient, type SolverConfig, type StorageMode } from "@/lib/desktop-solver";
 import type { ComboRow, SolveResults } from "@/lib/poker";
+import { saveSpotToCloud } from "@/lib/solved-spots";
+import { uploadTree } from "@/lib/tree-storage";
 
 interface SolveLog {
   time: string;
@@ -12,8 +16,9 @@ interface SolveLog {
 }
 
 interface ProgressPoint {
-  exploitability: number;
+  exploitability?: number | null;
   iteration: number;
+  phase?: "iterationComplete" | "exploitability";
 }
 
 interface MatrixCell {
@@ -107,31 +112,6 @@ const RANGE_TIERS = {
 type GameType = (typeof GAME_TYPES)[number];
 type PotType = (typeof POT_TYPES)[number];
 
-interface SolverConfig {
-  oopRange: string;
-  ipRange: string;
-  board: number[];
-  startingPot: number;
-  effectiveStack: number;
-  rakeRate: number;
-  rakeCap: number;
-  oopFlopBet: string;
-  oopFlopRaise: string;
-  ipFlopBet: string;
-  ipFlopRaise: string;
-  oopTurnBet: string;
-  oopTurnRaise: string;
-  ipTurnBet: string;
-  ipTurnRaise: string;
-  oopRiverBet: string;
-  oopRiverRaise: string;
-  ipRiverBet: string;
-  ipRiverRaise: string;
-  addAllinThreshold: number;
-  forceAllinThreshold: number;
-  mergingThreshold: number;
-}
-
 type NumericSolverConfigKey =
   | "rakeRate"
   | "rakeCap"
@@ -141,7 +121,7 @@ type NumericSolverConfigKey =
 
 type ActionSolverConfigKey = Exclude<
   keyof SolverConfig,
-  "oopRange" | "ipRange" | "board" | "startingPot" | "effectiveStack" | NumericSolverConfigKey
+  "oopRange" | "ipRange" | "board" | "startingPot" | "effectiveStack" | "storageMode" | NumericSolverConfigKey
 >;
 
 type SolverActionConfig = Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey>;
@@ -191,6 +171,7 @@ const ACTION_LABELS: Array<{ key: ActionSolverConfigKey; label: string; raise: b
 ];
 
 type TreePreset = "simple" | "complex";
+type ProgressMode = "fast" | "balanced" | "detailed";
 
 const TREE_PRESETS: Record<TreePreset, {
   label: string;
@@ -227,6 +208,18 @@ const NUMERIC_LABELS: Array<{ key: NumericSolverConfigKey; label: string }> = [
   { key: "forceAllinThreshold", label: "Force all-in threshold" },
   { key: "mergingThreshold", label: "Merging threshold" },
 ];
+
+const STORAGE_MODE_OPTIONS: Array<{ label: string; mode: StorageMode; note: string }> = [
+  { label: "Auto", mode: "auto", note: "Use uncompressed up to 8 GB, then compressed." },
+  { label: "Prefer speed", mode: "preferSpeed", note: "Use uncompressed unless the tree is very large." },
+  { label: "Prefer memory", mode: "preferMemory", note: "Force compressed storage." },
+];
+
+const PROGRESS_MODES: Record<ProgressMode, { interval: number; label: string; note: string }> = {
+  fast: { interval: 50, label: "Fast", note: "Exploitability every 50 iterations." },
+  balanced: { interval: 25, label: "Balanced", note: "Exploitability every 25 iterations." },
+  detailed: { interval: 10, label: "Detailed", note: "Exploitability every 10 iterations." },
+};
 
 function buildTreePresetActionConfig(
   preset: TreePreset
@@ -448,6 +441,10 @@ function formatStrategyPercent(freq: number): string {
   return pct.toFixed(1);
 }
 
+function formatExploitability(value: number | null | undefined, digits: number): string {
+  return value === null || value === undefined ? "--" : value.toFixed(digits);
+}
+
 function streetForBoardLength(length: number): "FLOP" | "TURN" | "RIVER" {
   if (length >= 5) return "RIVER";
   if (length === 4) return "TURN";
@@ -626,6 +623,14 @@ function classNames(...classes: Array<string | false | null | undefined>): strin
   return classes.filter(Boolean).join(" ");
 }
 
+function waitForPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
 const PAINTBRUSH_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="%23e0f2fe" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.37 2.63 14 7l-1.59-1.59a2 2 0 0 0-2.82 0L8 7l9 9 1.59-1.59a2 2 0 0 0 0-2.82L17 10l4.37-4.37a2.12 2.12 0 1 0-3-3Z"/><path d="M9 8 5 12v4h4l4-4"/></svg>'
 )}") 2 22, crosshair`;
@@ -633,7 +638,7 @@ const PAINTBRUSH_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
 function pokerCardAsset(card: string): string {
   const rank = card.slice(0, -1).toUpperCase().replace("T", "10");
   const suit = card.slice(-1).toUpperCase();
-  return `/pokercards/${rank}${suit}.svg`;
+  return `/PokerCards/${rank}${suit}.svg`;
 }
 
 interface PlayingCardProps {
@@ -641,7 +646,7 @@ interface PlayingCardProps {
   card?: string;
   className?: string;
   disabled?: boolean;
-  onClick?: () => void;
+  onClick?: (event: MouseEvent<HTMLButtonElement>) => void;
   placeholder?: ReactNode;
   tone?: "amber" | "sky" | "zinc";
 }
@@ -938,8 +943,239 @@ function Modal({
   );
 }
 
+const POPUP_EASE = "cubic-bezier(0.22, 1, 0.36, 1)";
+const POPUP_OPEN_MS = 320;
+const POPUP_CLOSE_MS = 260;
+const POPUP_PANEL_WIDTH = 384;
+const POPUP_PANEL_WIDTH_WIDE = 672;
+const POPUP_VIEWPORT_PADDING = 16;
+
+function useAnchoredPopup() {
+  const [open, setOpen] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const anchorRef = useRef<HTMLElement | null>(null);
+  const setAnchorRef = useCallback((node: HTMLElement | null) => {
+    anchorRef.current = node;
+  }, []);
+
+  const openPopup = useCallback(() => {
+    setClosing(false);
+    setOpen(true);
+  }, []);
+
+  const closePopup = useCallback(() => {
+    if (!open || closing) return;
+    setClosing(true);
+  }, [closing, open]);
+
+  const finishClose = useCallback(() => {
+    setOpen(false);
+    setClosing(false);
+  }, []);
+
+  return { anchorRef, closePopup, closing, finishClose, open, openPopup, setAnchorRef };
+}
+
+function FadePopup({
+  anchorRef,
+  children,
+  closing,
+  onClose,
+  onClosed,
+  panelWidth = POPUP_PANEL_WIDTH,
+}: {
+  anchorRef: RefObject<HTMLElement | null>;
+  children: ReactNode;
+  closing: boolean;
+  onClose: () => void;
+  onClosed: () => void;
+  panelWidth?: number;
+}) {
+  const [mounted, setMounted] = useState(false);
+  const [shown, setShown] = useState(false);
+  const [anchorPosition, setAnchorPosition] = useState<{ top: number; left: number } | null>(null);
+  const closedRef = useRef(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const updateAnchorPosition = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (!anchor) {
+      setAnchorPosition(null);
+      return;
+    }
+
+    const rect = anchor.getBoundingClientRect();
+    const panel = panelRef.current;
+    const measuredPanelWidth = panel?.offsetWidth ?? panelWidth;
+    const panelHeight = panel?.offsetHeight ?? 0;
+    const gap = 12;
+
+    let left = rect.right + gap;
+    const anchorCenterY = rect.top + rect.height / 2;
+    let top = anchorCenterY;
+
+    if (left + measuredPanelWidth > window.innerWidth - POPUP_VIEWPORT_PADDING) {
+      left = Math.max(POPUP_VIEWPORT_PADDING, rect.left - measuredPanelWidth - gap);
+    }
+
+    if (panelHeight > 0) {
+      const minCenterY = POPUP_VIEWPORT_PADDING + panelHeight / 2;
+      const maxCenterY = window.innerHeight - POPUP_VIEWPORT_PADDING - panelHeight / 2;
+      top = Math.min(Math.max(minCenterY, anchorCenterY), maxCenterY);
+    }
+
+    setAnchorPosition({ top, left });
+  }, [anchorRef, panelWidth]);
+
+  useEffect(() => {
+    let frame2 = 0;
+    const frame1 = window.requestAnimationFrame(() => {
+      setMounted(true);
+      frame2 = window.requestAnimationFrame(() => setShown(true));
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame1);
+      window.cancelAnimationFrame(frame2);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!mounted) return;
+    updateAnchorPosition();
+  }, [mounted, updateAnchorPosition]);
+
+  useEffect(() => {
+    if (!mounted) return;
+
+    const handleLayout = () => updateAnchorPosition();
+    window.addEventListener("resize", handleLayout);
+    window.addEventListener("scroll", handleLayout, true);
+
+    const panel = panelRef.current;
+    const observer = panel ? new ResizeObserver(handleLayout) : null;
+    if (panel && observer) observer.observe(panel);
+
+    return () => {
+      window.removeEventListener("resize", handleLayout);
+      window.removeEventListener("scroll", handleLayout, true);
+      observer?.disconnect();
+    };
+  }, [mounted, updateAnchorPosition]);
+
+  useEffect(() => {
+    if (shown) updateAnchorPosition();
+  }, [shown, updateAnchorPosition]);
+
+  useEffect(() => {
+    if (!closing) {
+      closedRef.current = false;
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      if (closedRef.current) return;
+      closedRef.current = true;
+      onClosed();
+    }, POPUP_CLOSE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [closing, onClosed]);
+
+  if (!mounted) return null;
+
+  const isVisible = shown && !closing;
+  const panelDuration = closing ? POPUP_CLOSE_MS : POPUP_OPEN_MS;
+  const panelMotionClass = isVisible
+    ? "-translate-y-1/2 translate-x-0 scale-100 opacity-100"
+    : "-translate-y-1/2 -translate-x-5 scale-[0.985] opacity-0";
+
+  return createPortal(
+    <>
+      <div
+        className={`fixed inset-0 z-[100] motion-reduce:transition-none ${
+          isVisible ? "bg-black/55 opacity-100" : "pointer-events-none bg-black/0 opacity-0"
+        }`}
+        onClick={onClose}
+        style={{
+          transitionDuration: `${panelDuration}ms`,
+          transitionProperty: "opacity",
+          transitionTimingFunction: POPUP_EASE,
+        }}
+      />
+      <div
+        ref={panelRef}
+        className={`fixed z-[101] origin-[left_center] overflow-hidden rounded-lg border border-white/10 bg-[#1d1e21] shadow-2xl motion-reduce:transition-none ${panelMotionClass}`}
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          left: anchorPosition?.left ?? 0,
+          top: anchorPosition?.top ?? 0,
+          transitionDuration: `${panelDuration}ms`,
+          transitionProperty: "transform, opacity",
+          transitionTimingFunction: POPUP_EASE,
+          width: `min(calc(100vw - ${POPUP_VIEWPORT_PADDING * 2}px), ${panelWidth}px)`,
+        }}
+      >
+        {children}
+      </div>
+    </>,
+    document.body,
+  );
+}
+
+function SidebarPopup({
+  anchorRef,
+  children,
+  closing,
+  onClose,
+  onClosed,
+  open,
+  panelWidth = POPUP_PANEL_WIDTH,
+  subtitle,
+  title,
+}: {
+  anchorRef: RefObject<HTMLElement | null>;
+  children: ReactNode;
+  closing: boolean;
+  onClose: () => void;
+  onClosed: () => void;
+  open: boolean;
+  panelWidth?: number;
+  subtitle?: string;
+  title: string;
+}) {
+  if (!open) return null;
+
+  return (
+    <FadePopup
+      anchorRef={anchorRef}
+      closing={closing}
+      onClose={onClose}
+      onClosed={onClosed}
+      panelWidth={panelWidth}
+    >
+      <div className="scrollbar-hidden max-h-[min(75vh,calc(100vh-2rem))] overflow-y-auto p-4">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">{title}</div>
+            {subtitle ? <div className="mt-0.5 text-xs text-zinc-500">{subtitle}</div> : null}
+          </div>
+          <button
+            className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
+            onClick={onClose}
+            type="button"
+          >
+            Close
+          </button>
+        </div>
+        {children}
+      </div>
+    </FadePopup>
+  );
+}
+
 export default function SolvePage() {
-  const workerRef = useRef<Worker | null>(null);
+  const solverRef = useRef<DesktopSolverClient | null>(null);
   const [logs, setLogs] = useState<SolveLog[]>([]);
   const [progress, setProgress] = useState<ProgressPoint | null>(null);
   const [results, setResults] = useState<SolveResults | null>(null);
@@ -947,12 +1183,17 @@ export default function SolvePage() {
   const [nodeLoading, setNodeLoading] = useState(false);
   const [currentHistory, setCurrentHistory] = useState<number[]>([]);
   const [pathSegments, setPathSegments] = useState<PathSegment[]>([]);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [devFixtures, setDevFixtures] = useState<DevSolveFixture[]>([]);
-  const [devFixturesOpen, setDevFixturesOpen] = useState(false);
   const [fixtureMode, setFixtureMode] = useState<DevFixtureMode | null>(null);
-  const [spotPresetOpen, setSpotPresetOpen] = useState(false);
-  const [solveSettingsOpen, setSolveSettingsOpen] = useState(false);
+  const spotPresetPopup = useAnchoredPopup();
+  const betSizingPopup = useAnchoredPopup();
+  const solveSettingsPopup = useAnchoredPopup();
+  const advancedPopup = useAnchoredPopup();
+  const devFixturesPopup = useAnchoredPopup();
+  const boardPickerPopup = useAnchoredPopup();
+  const closeDevFixturesPopup = devFixturesPopup.closePopup;
+  const finishBoardPickerPopupClose = boardPickerPopup.finishClose;
+  const openDevFixturesPopup = devFixturesPopup.openPopup;
   const [nodeLockBrushAction, setNodeLockBrushAction] = useState(1);
   const [nodeLockBrushPercents, setNodeLockBrushPercents] = useState<number[]>([0, 100]);
   const [nodeLockEnabled, setNodeLockEnabled] = useState(false);
@@ -963,6 +1204,8 @@ export default function SolvePage() {
   const [centerView, setCenterView] = useState<CenterView>("strategy");
   const [detailTab, setDetailTab] = useState<DetailTab>("hands");
   const [rightLockTab, setRightLockTab] = useState<RightLockTab>("strategy");
+  const [cloudSaveStatus, setCloudSaveStatus] = useState<"idle" | "saving" | "done" | "error">("idle");
+  const [cloudSaveError, setCloudSaveError] = useState<string | null>(null);
 
   const [gameType, setGameType] = useState<GameType>("6-max");
   const [heroPosition, setHeroPosition] = useState("UTG");
@@ -981,6 +1224,8 @@ export default function SolvePage() {
   const [effectiveStack, setEffectiveStack] = useState(910);
   const [maxIterations, setMaxIterations] = useState(200);
   const [targetExpl, setTargetExpl] = useState(0.1);
+  const [progressMode, setProgressMode] = useState<ProgressMode>("balanced");
+  const [storageMode, setStorageMode] = useState<StorageMode>("auto");
   const [treePreset, setTreePreset] = useState<TreePreset>("simple");
   const [actionConfig, setActionConfig] = useState<Pick<SolverConfig, ActionSolverConfigKey | NumericSolverConfigKey>>(initialBaseline);
 
@@ -1017,8 +1262,10 @@ export default function SolvePage() {
   const actingPlayer = results?.player?.toUpperCase() ?? "OOP";
   const actingSeat = results?.player === "oop" ? oopPosition : results?.player === "ip" ? ipPosition : "Chance";
   const currentStreet = streetName(results?.currentBoard.length ?? boardCards.length);
-  const finalExploitability = progress?.exploitability ?? 0;
-  const exploitabilityPct = startingPot > 0 ? (finalExploitability / startingPot) * 100 : 0;
+  const finalExploitability = progress?.exploitability ?? null;
+  const exploitabilityPct = finalExploitability !== null && startingPot > 0
+    ? (finalExploitability / startingPot) * 100
+    : null;
   const currentNodeLockKey = historyKey(currentHistory);
   const nodeLockHands = useMemo(
     () => nodeLocksByHistory[currentNodeLockKey] ?? {},
@@ -1039,8 +1286,9 @@ export default function SolvePage() {
     board: boardCards.length >= 3 ? parseBoard(board) : [],
     startingPot,
     effectiveStack,
+    storageMode,
     ...actionConfig,
-  }), [actionConfig, board, boardCards.length, effectiveStack, ipRange, oopRange, startingPot]);
+  }), [actionConfig, board, boardCards.length, effectiveStack, ipRange, oopRange, startingPot, storageMode]);
   const validationErrors = useMemo(() => validateSolveConfig(solverConfig, boardSlots), [boardSlots, solverConfig]);
   const activeTreePreset = useMemo(() => treePresetFromActionConfig(actionConfig) ?? treePreset, [actionConfig, treePreset]);
   const activePresetMeta = TREE_PRESETS[activeTreePreset];
@@ -1077,11 +1325,11 @@ export default function SolvePage() {
     try {
       const fixtures = await loadDevSolveFixtures();
       setDevFixtures(fixtures);
-      setDevFixturesOpen(true);
+      openDevFixturesPopup();
     } catch (err) {
       addLog(`ERROR: Failed to load dev fixtures: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [addLog]);
+  }, [addLog, openDevFixturesPopup]);
 
   const loadDevFixture = useCallback((fixture: DevSolveFixture) => {
     const nodes = buildDevFixtureNodeMap(fixture);
@@ -1092,8 +1340,8 @@ export default function SolvePage() {
       return;
     }
 
-    workerRef.current?.terminate();
-    workerRef.current = null;
+    void solverRef.current?.dispose();
+    solverRef.current = null;
 
     setGameType(fixture.gameType);
     setHeroPosition(fixture.heroPosition);
@@ -1103,6 +1351,7 @@ export default function SolvePage() {
     setIpRange(fixture.ipRange);
     setBoardSlots(fixture.boardSlots);
     setActiveBoardSlot(null);
+    finishBoardPickerPopupClose();
     setStartingPot(fixture.startingPot);
     setEffectiveStack(fixture.effectiveStack);
     setMaxIterations(fixture.maxIterations);
@@ -1118,7 +1367,7 @@ export default function SolvePage() {
     setPathSegments([]);
     setNodeLocksByHistory({});
     setFixtureMode({ id: fixture.id, label: fixture.label, nodes });
-    setDevFixturesOpen(false);
+    closeDevFixturesPopup();
     setLogs([
       { time: new Date().toLocaleTimeString(), message: `Loaded dev fixture: ${fixture.label}` },
       {
@@ -1127,10 +1376,10 @@ export default function SolvePage() {
       },
       {
         time: new Date().toLocaleTimeString(),
-        message: `Final fixture exploitability = ${fixture.progress.exploitability.toFixed(4)}`,
+        message: `Final fixture exploitability = ${formatExploitability(fixture.progress.exploitability, 4)}`,
       },
     ]);
-  }, [addLog]);
+  }, [addLog, closeDevFixturesPopup, finishBoardPickerPopupClose]);
 
   useEffect(() => {
     if (!DEV_SOLVE_FIXTURES_ENABLED) return;
@@ -1198,8 +1447,9 @@ export default function SolvePage() {
   }, [presetRanges.ipRange, presetRanges.oopRange]);
 
   const stopWorker = useCallback(() => {
-    workerRef.current?.terminate();
-    workerRef.current = null;
+    void solverRef.current?.cancel();
+    void solverRef.current?.dispose();
+    solverRef.current = null;
     setSolving(false);
     setNodeLoading(false);
     addLog("Solve cancelled.");
@@ -1224,12 +1474,26 @@ export default function SolvePage() {
       return;
     }
 
-    if (!workerRef.current) return;
+    const solver = solverRef.current;
+    if (!solver) return;
 
     setCurrentHistory(history);
     setPathSegments(segments);
     setNodeLoading(true);
-    workerRef.current.postMessage({ type: "get_results", history });
+    solver
+      .getResults(history)
+      .then((nextResults) => {
+        setResults(nextResults);
+        setCurrentHistory(nextResults.history ?? []);
+        addLog(`${nextResults.history?.length ? "Selected" : "Root"} node player: ${nextResults.player}`);
+        addLog(`OOP EV = ${nextResults.rootEvOop.toFixed(4)}; equity = ${nextResults.rootEqOop.toFixed(5)}`);
+      })
+      .catch((err) => {
+        addLog(`ERROR: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        setNodeLoading(false);
+      });
   }, [addLog, fixtureMode, nodeLoading, results, solving]);
 
   const navigateAction = useCallback((actionIndex: number, action: string, total: number) => {
@@ -1287,10 +1551,22 @@ export default function SolvePage() {
     navigateToHistory(nextHistory, nextSegments);
   }, [currentHistory, navigateToHistory, nodeLoading, pathSegments, results, solving]);
 
-  const openBoardSlot = useCallback((slotIndex: number) => {
+  const openBoardSlot = useCallback((slotIndex: number, anchor: HTMLElement) => {
+    boardPickerPopup.setAnchorRef(anchor);
     setActiveBoardSlot(slotIndex);
     setActiveCardRank(boardSlots[slotIndex]?.slice(0, -1) || "A");
-  }, [boardSlots]);
+    boardPickerPopup.openPopup();
+  }, [boardPickerPopup, boardSlots]);
+
+  const closeBoardPicker = useCallback(() => {
+    if (activeBoardSlot === null || boardPickerPopup.closing) return;
+    boardPickerPopup.closePopup();
+  }, [activeBoardSlot, boardPickerPopup]);
+
+  const finishBoardPickerClose = useCallback(() => {
+    setActiveBoardSlot(null);
+    boardPickerPopup.finishClose();
+  }, [boardPickerPopup]);
 
   const openChancePicker = useCallback(() => {
     if (!results?.isChance || results.possibleCards.length === 0) return;
@@ -1316,8 +1592,8 @@ export default function SolvePage() {
       next[activeBoardSlot] = card;
       return next;
     });
-    setActiveBoardSlot(null);
-  }, [activeBoardSlot]);
+    closeBoardPicker();
+  }, [activeBoardSlot, closeBoardPicker]);
 
   const clearBoardSlot = useCallback((slotIndex: number) => {
     setBoardSlots((current) => {
@@ -1325,10 +1601,10 @@ export default function SolvePage() {
       next[slotIndex] = "";
       return next;
     });
-    setActiveBoardSlot(null);
-  }, []);
+    closeBoardPicker();
+  }, [closeBoardPicker]);
 
-  const handleSolve = useCallback((lockStrategy?: number[] | null) => {
+  const handleSolve = useCallback(async (lockStrategy?: number[] | null) => {
     const activeLock = Array.isArray(lockStrategy) ? lockStrategy : null;
     const solveHistory = activeLock ? currentHistory : [];
     const errors = validateSolveConfig(solverConfig, boardSlots);
@@ -1338,12 +1614,14 @@ export default function SolvePage() {
       return;
     }
 
-    workerRef.current?.terminate();
+    await solverRef.current?.dispose();
     setFixtureMode(null);
     setSolving(true);
     setNodeLoading(false);
     setResults(null);
     setProgress(null);
+    setCloudSaveStatus("idle");
+    setCloudSaveError(null);
     setCurrentHistory(solveHistory);
     if (!activeLock) {
       setPathSegments([]);
@@ -1351,120 +1629,149 @@ export default function SolvePage() {
     }
     setLogs([]);
 
-    const worker = new Worker("/solver-worker.js?v=15", { type: "module" });
-    workerRef.current = worker;
-
-    worker.onmessage = (event) => {
-      const msg = event.data;
-
-      switch (msg.type) {
-        case "init_done":
-          addLog(`Game initialized. Memory: ${msg.memoryUsageMB.toFixed(0)} MB`);
-          break;
-        case "memory_allocated":
-          addLog(activeLock ? "Memory allocated. Applying nodelock." : "Memory allocated. Starting solve.");
-          if (activeLock) {
-            worker.postMessage({
-              type: "lock_current_node",
-              history: solveHistory,
-              strategy: activeLock,
-            });
-          } else {
-            worker.postMessage({
-              type: "solve",
-              maxIterations,
-              targetExploitability: (startingPot * targetExpl) / 100,
-            });
-          }
-          break;
-        case "locked_done":
-          addLog("Nodelock applied. Starting re-solve.");
-          worker.postMessage({
-            type: "solve",
-            maxIterations,
-            targetExploitability: (startingPot * targetExpl) / 100,
-          });
-          break;
-        case "progress":
-          setProgress({
-            exploitability: msg.exploitability,
-            iteration: msg.iteration,
-          });
-          addLog(`Iteration ${msg.iteration}: exploitability = ${msg.exploitability.toFixed(4)}`);
-          break;
-        case "solve_done":
-          setProgress((current) => ({
-            exploitability: msg.exploitability,
-            iteration: current?.iteration ?? maxIterations,
-          }));
-          addLog(`Solve complete. Final exploitability = ${msg.exploitability.toFixed(4)}`);
-          setNodeLoading(true);
-          worker.postMessage({ type: "get_results", history: solveHistory });
-          break;
-        case "results":
-          setResults({
-            actions: msg.actions,
-            currentBoard: msg.currentBoard ?? [],
-            history: msg.history ?? [],
-            isChance: Boolean(msg.isChance),
-            isTerminal: Boolean(msg.isTerminal),
-            numActions: msg.numActions,
-            player: msg.player,
-            possibleCards: msg.possibleCards ?? [],
-            privateCards: msg.privateCards,
-            rootEqIp: msg.rootEqIp,
-            rootEqOop: msg.rootEqOop,
-            rootEvIp: msg.rootEvIp,
-            rootEvOop: msg.rootEvOop,
-            strategy: msg.strategy,
-            totalBetAmount: msg.totalBetAmount ?? [],
-          });
-          setCurrentHistory(msg.history ?? []);
-          setNodeLoading(false);
-          addLog(`${msg.history?.length ? "Selected" : "Root"} node player: ${msg.player}`);
-          addLog(`OOP EV = ${msg.rootEvOop.toFixed(4)}; equity = ${msg.rootEqOop.toFixed(5)}`);
-          setSolving(false);
-          if (activeLock) {
-            setNodeLockEnabled(false);
-            addLog("Nodelock applied. Returned to study mode.");
-          }
-          break;
-        case "log":
-          addLog(msg.message);
-          break;
-        case "error":
-          addLog(`ERROR: ${msg.message}`);
-          setSolving(false);
-          setNodeLoading(false);
-          break;
-      }
-    };
-
-    worker.onerror = (err) => {
-      addLog(`Worker error: ${err.message}`);
-      setSolving(false);
-      setNodeLoading(false);
-    };
+    const solver = new DesktopSolverClient();
+    solverRef.current = solver;
 
     try {
-      worker.postMessage({
-        type: "init",
-        config: solverConfig,
+      addLog("UI: creating native solver event listeners.");
+      await waitForPaint();
+      await solver.listen({
+        onError: (message) => addLog(`ERROR: ${message}`),
+        onLog: addLog,
+        onMemoryAllocated: () => {
+          addLog(activeLock ? "Memory allocated. Applying nodelock." : "Memory allocated. Starting solve.");
+        },
+        onProgress: (point) => {
+          setProgress((current) => ({
+            exploitability: point.exploitability ?? current?.exploitability ?? null,
+            iteration: point.iteration,
+            phase: point.phase,
+          }));
+          if (point.exploitability === null || point.exploitability === undefined) {
+            addLog(`Iteration ${point.iteration}/${maxIterations} complete.`);
+          } else {
+            addLog(`Iteration ${point.iteration}: exploitability = ${point.exploitability.toFixed(4)}`);
+          }
+        },
       });
+
+      addLog("UI: sending config to native Rust solver.");
+      await waitForPaint();
+      const initResult = await solver.init(solverConfig);
+      addLog(`Game initialized. Memory: ${initResult.memoryUsageMb.toFixed(0)} MB`);
+
+      if (activeLock) {
+        addLog("UI: applying nodelock through native solver.");
+        await solver.lockCurrentNode(solveHistory, activeLock);
+        addLog("Nodelock applied. Starting re-solve.");
+      }
+
+      addLog(`UI: starting native solve for ${maxIterations} iterations.`);
+      await waitForPaint();
+      const done = await solver.solve(
+        maxIterations,
+        (startingPot * targetExpl) / 100,
+        PROGRESS_MODES[progressMode].interval
+      );
+      addLog("UI: native solve command returned.");
+      setProgress((current) => ({
+        exploitability: done.exploitability,
+        iteration: current?.iteration ?? maxIterations,
+        phase: "exploitability",
+      }));
+
+      if (done.cancelled) {
+        addLog(`Solve cancelled. Last exploitability = ${done.exploitability.toFixed(4)}`);
+        setSolving(false);
+        return;
+      }
+
+      addLog(`Solve complete. Final exploitability = ${done.exploitability.toFixed(4)}`);
+      setNodeLoading(true);
+      addLog("UI: requesting root results from native solver.");
+      const nextResults = await solver.getResults(solveHistory);
+      setResults(nextResults);
+      setCurrentHistory(nextResults.history ?? []);
+      setNodeLoading(false);
+      addLog(`${nextResults.history?.length ? "Selected" : "Root"} node player: ${nextResults.player}`);
+      addLog(`OOP EV = ${nextResults.rootEvOop.toFixed(4)}; equity = ${nextResults.rootEqOop.toFixed(5)}`);
+
+      if (activeLock) {
+        setNodeLockEnabled(false);
+        addLog("Nodelock applied. Returned to study mode.");
+      }
     } catch (err) {
       addLog(`Config error: ${err instanceof Error ? err.message : String(err)}`);
       setSolving(false);
       setNodeLoading(false);
+      return;
     }
+    setSolving(false);
   }, [
     addLog,
     boardSlots,
     currentHistory,
     maxIterations,
+    progressMode,
     startingPot,
     solverConfig,
     targetExpl,
   ]);
+
+  const handleSaveToCloud = useCallback(async () => {
+    if (!solverRef.current || !progress) return;
+
+    setCloudSaveStatus("saving");
+    setCloudSaveError(null);
+
+    try {
+      addLog("UI: extracting full game tree...");
+      const nodes = await solverRef.current.extractTree();
+      addLog(`Extracted ${nodes.length} decision nodes.`);
+
+      addLog("UI: saving spot config to cloud...");
+      const spot = await saveSpotToCloud({
+        board: boardSlots.join(" "),
+        config: solverConfig,
+        exploitability: progress.exploitability ?? 0,
+        gameType,
+        ipPosition: villainPosition,
+        iterations: progress.iteration,
+        memoryUsageMb: 0,
+        oopPosition: heroPosition,
+        potType,
+        solveTimeMs: 0,
+      });
+      addLog(`Spot saved with id: ${spot.id}`);
+
+      addLog("UI: compressing and uploading tree to Supabase Storage...");
+      const upload = await uploadTree(spot.id, nodes);
+      addLog(`Tree uploaded: ${(upload.compressedBytes / 1024 / 1024).toFixed(1)} MB compressed (${(upload.sizeBytes / 1024 / 1024).toFixed(1)} MB raw)`);
+
+      // Update spot record with tree path
+      await saveSpotToCloud({
+        board: boardSlots.join(" "),
+        config: solverConfig,
+        exploitability: progress.exploitability ?? 0,
+        gameType,
+        ipPosition: villainPosition,
+        iterations: progress.iteration,
+        memoryUsageMb: 0,
+        oopPosition: heroPosition,
+        potType,
+        solveTimeMs: 0,
+        treePath: upload.path,
+      });
+
+      addLog("Cloud save complete!");
+      setCloudSaveStatus("done");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(`Cloud save error: ${msg}`);
+      setCloudSaveError(msg);
+      setCloudSaveStatus("error");
+    }
+  }, [addLog, boardSlots, gameType, heroPosition, potType, progress, solverConfig, villainPosition]);
 
   const updateNodeLockHands = useCallback((
     updater: Record<number, number[]> | ((current: Record<number, number[]>) => Record<number, number[]>)
@@ -1581,7 +1888,7 @@ export default function SolvePage() {
             unoptimized
             width={126}
           />
-          <nav className="ml-5 hidden items-center gap-1 text-sm text-zinc-400 md:flex">
+	          <nav className="ml-5 hidden items-center gap-1 text-sm text-zinc-400 md:flex">
             <button
               className={
                 centerView === "strategy"
@@ -1620,12 +1927,15 @@ export default function SolvePage() {
                 <h1 className="text-lg font-semibold">Configure Spot</h1>
                 <p className="text-xs text-zinc-500">{gameType} postflop tree</p>
               </div>
-              <span className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-400">300bb</span>
+              <span className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-400">
+                {effectiveStack} chips
+              </span>
             </div>
 
             <button
+	              ref={spotPresetPopup.setAnchorRef}
               className="w-full rounded border border-white/10 bg-[#1d1e21] p-3 text-left hover:border-sky-300/40 hover:bg-[#162b35]"
-              onClick={() => setSpotPresetOpen(true)}
+              onClick={spotPresetPopup.openPopup}
               type="button"
             >
               <div className="mb-3 flex items-center justify-between">
@@ -1652,8 +1962,8 @@ export default function SolvePage() {
                   <span className="px-1 text-zinc-700">/</span>
                   IP <span className="font-semibold text-zinc-200">{ipPosition}</span>
                 </div>
-              </div>
-            </button>
+	              </div>
+	            </button>
 
             <div>
               <div className="mb-2 flex items-center justify-between">
@@ -1671,7 +1981,7 @@ export default function SolvePage() {
                         active={active}
                         card={card || undefined}
                         className="w-full"
-                        onClick={() => openBoardSlot(index)}
+                        onClick={(event) => openBoardSlot(index, event.currentTarget)}
                         tone="sky"
                       />
                       <div className="text-center text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500">
@@ -1681,86 +1991,9 @@ export default function SolvePage() {
                   );
                 })}
               </div>
-
-              {activeBoardSlot !== null && (
-                <div className="mt-3 rounded border border-white/10 bg-[#1d1e21] p-3">
-                  <div className="mb-3 flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-semibold">Choose card</div>
-                      <div className="text-xs text-zinc-500">
-                        Flop card {activeBoardSlot + 1}
-                      </div>
-                    </div>
-                    <div className="flex gap-2">
-                      {boardSlots[activeBoardSlot] && (
-                        <button
-                          className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
-                          onClick={() => clearBoardSlot(activeBoardSlot)}
-                          type="button"
-                        >
-                          Clear
-                        </button>
-                      )}
-                      <button
-                        className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
-                        onClick={() => setActiveBoardSlot(null)}
-                        type="button"
-                      >
-                        Close
-                      </button>
-                    </div>
-                  </div>
-                  <div className="space-y-3">
-                    <div>
-                      <div className="mb-1.5 text-xs font-medium text-zinc-500">Rank</div>
-                      <div className="grid grid-cols-7 gap-1.5">
-                        {CARD_PICKER_RANKS.split("").map((rank) => (
-                          <button
-                            className={
-                              activeCardRank === rank
-                                ? "rounded bg-sky-300 px-2 py-2 text-sm font-semibold text-black"
-                                : "rounded bg-[#26272a] px-2 py-2 text-sm font-semibold text-zinc-100 hover:bg-[#33353a]"
-                            }
-                            key={rank}
-                            onClick={() => setActiveCardRank(rank)}
-                            type="button"
-                          >
-                            {rank}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="mb-1.5 flex items-center justify-between">
-                        <span className="text-xs font-medium text-zinc-500">Suit</span>
-                        <span className="text-xs text-zinc-600">Pick {activeCardRank} suit</span>
-                      </div>
-                      <div className="grid grid-cols-4 gap-1.5">
-                        {CARD_PICKER_SUITS.split("").map((suit) => {
-                          const card = `${activeCardRank}${suit}`;
-                          const selectedInOtherSlot =
-                            selectedBoardCards.has(card) && boardSlots[activeBoardSlot] !== card;
-
-                          return (
-                            <PlayingCard
-                              active={boardSlots[activeBoardSlot] === card}
-                              card={card}
-                              className="w-full"
-                              disabled={selectedInOtherSlot}
-                              key={suit}
-                              onClick={() => selectBoardCard(card)}
-                              tone="sky"
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
+	    <div className="grid grid-cols-2 gap-3">
               <label className="block">
                 <span className="mb-1 block text-xs font-medium text-zinc-400">Pot</span>
                 <input
@@ -1781,38 +2014,18 @@ export default function SolvePage() {
               </label>
             </div>
 
-            <div className="rounded border border-white/10 bg-[#1d1e21] p-3">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold">Bet sizing</h2>
-                {!actionConfigMatchesPreset && (
-                  <span className="rounded bg-amber-300/10 px-2 py-0.5 text-[11px] text-amber-100">Custom tree</span>
-                )}
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                {(Object.keys(TREE_PRESETS) as TreePreset[]).map((preset) => {
-                  const active = treePreset === preset && actionConfigMatchesPreset;
-
-                  return (
-                    <button
-                      className={
-                        active
-                          ? "rounded border border-sky-300/60 bg-sky-300 px-3 py-2.5 text-left text-xs font-semibold text-black"
-                          : "rounded border border-white/10 bg-[#222326] px-3 py-2.5 text-left text-xs font-semibold text-zinc-200 hover:border-sky-300/50 hover:bg-[#22313a]"
-                      }
-                      key={preset}
-                      onClick={() => selectTreePreset(preset)}
-                      type="button"
-                    >
-                      {TREE_PRESETS[preset].label}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="mt-3 text-xs leading-relaxed text-zinc-500">{activePresetMeta.description}</p>
-              <div className="mt-2 rounded bg-black/20 px-3 py-2 font-mono text-[11px] text-zinc-400">
-                Bets {activePresetMeta.bets} · Raises {activePresetMeta.raises}
-              </div>
-            </div>
+            <button
+              ref={betSizingPopup.setAnchorRef}
+              className="flex w-full items-center justify-between rounded border border-white/10 bg-[#1d1e21] px-3 py-2.5 text-left hover:border-sky-300/40 hover:bg-[#162b35]"
+              onClick={betSizingPopup.openPopup}
+              type="button"
+            >
+              <span className="text-sm font-semibold">Bet Sizing</span>
+              <span className="flex items-center gap-1.5 text-sm text-zinc-400">
+                {actionConfigIsDefault ? activePresetMeta.label : "Custom tree"}
+                <span aria-hidden="true" className="text-zinc-500">›</span>
+              </span>
+            </button>
 
             <div className="space-y-2">
               {validationErrors.length > 0 && (
@@ -1835,9 +2048,10 @@ export default function SolvePage() {
                   {solving ? "Solving..." : pendingNodeLockStrategy ? "Solve With Lock" : "Solve Tree"}
                 </button>
                 <button
+                  ref={solveSettingsPopup.setAnchorRef}
                   aria-label="Solve settings"
                   className="grid h-11 place-items-center rounded border border-white/10 bg-[#222326] text-xl text-zinc-200 hover:border-sky-300/60 hover:bg-[#24313a]"
-                  onClick={() => setSolveSettingsOpen(true)}
+                  onClick={solveSettingsPopup.openPopup}
                   type="button"
                 >
                   ⚙
@@ -1871,6 +2085,7 @@ export default function SolvePage() {
                     <div className="mb-2 truncate text-xs text-zinc-300">{fixtureMode.label}</div>
                   )}
                   <button
+                    ref={devFixturesPopup.setAnchorRef}
                     className="h-9 w-full rounded bg-amber-200 text-sm font-semibold text-black hover:bg-amber-100"
                     onClick={openDevFixtures}
                     type="button"
@@ -1880,12 +2095,11 @@ export default function SolvePage() {
                 </div>
               )}
             </div>
-          </section>
-
           <section className="mt-5">
             <button
+              ref={advancedPopup.setAnchorRef}
               className="flex w-full items-center justify-between rounded border border-white/10 bg-[#1d1e21] px-3 py-3 text-left hover:border-sky-300/40 hover:bg-[#162b35]"
-              onClick={() => setAdvancedOpen(true)}
+              onClick={advancedPopup.openPopup}
               type="button"
             >
               <span>
@@ -1895,7 +2109,7 @@ export default function SolvePage() {
               <span className="text-lg text-zinc-500">›</span>
             </button>
           </section>
-          {nodeLockLabel && !nodeLockEnabled && (
+	          {nodeLockLabel && !nodeLockEnabled && (
             <section className="mt-3 rounded border border-sky-300/20 bg-[#10242c]/60 p-3">
               <div className="flex items-start justify-between gap-3">
                 <div>
@@ -1910,9 +2124,10 @@ export default function SolvePage() {
                   Clear
                 </button>
               </div>
-            </section>
-          )}
-        </aside>
+	            </section>
+	          )}
+          </section>
+	        </aside>
 
         <section className="scrollbar-hidden min-w-0 overflow-y-auto bg-[#111214] p-3">
           <div className="scrollbar-hidden mb-2 flex gap-2 overflow-x-auto pb-1">
@@ -2161,7 +2376,7 @@ export default function SolvePage() {
             </div>
             <div className="flex items-center gap-2 text-xs text-zinc-500">
               <span>{progress ? `${progress.iteration}/${maxIterations}` : "0/0"}</span>
-              <span>Exploitability {exploitabilityPct.toFixed(3)}%</span>
+              <span>Exploitability {exploitabilityPct === null ? "measuring" : `${exploitabilityPct.toFixed(3)}%`}</span>
             </div>
           </div>
 
@@ -2272,6 +2487,7 @@ export default function SolvePage() {
               {solving ? "Solving..." : "Solve With Lock"}
             </button>
           ) : (
+            <>
             <div className="mb-4 grid grid-cols-3 gap-2">
               <div className="rounded border border-sky-300/40 bg-sky-300/10 p-3">
                 <div className="text-xs text-sky-200">OOP EV</div>
@@ -2286,6 +2502,31 @@ export default function SolvePage() {
                 <div className="text-xl font-semibold">40%</div>
               </div>
             </div>
+            {results && !solving && (
+              <div className="mb-4">
+                <button
+                  className={`h-10 w-full rounded font-semibold text-sm transition disabled:opacity-50 disabled:cursor-not-allowed ${
+                    cloudSaveStatus === "done"
+                      ? "bg-emerald-400/20 text-emerald-300 border border-emerald-400/30"
+                      : cloudSaveStatus === "error"
+                        ? "bg-red-400/20 text-red-300 border border-red-400/30"
+                        : "bg-white/8 text-zinc-200 hover:bg-white/12 border border-white/10"
+                  }`}
+                  disabled={cloudSaveStatus === "saving"}
+                  onClick={handleSaveToCloud}
+                  type="button"
+                >
+                  {cloudSaveStatus === "saving" ? "Extracting & uploading..." :
+                   cloudSaveStatus === "done" ? "Saved to cloud" :
+                   cloudSaveStatus === "error" ? "Retry save" :
+                   "Save to Cloud"}
+                </button>
+                {cloudSaveStatus === "error" && cloudSaveError && (
+                  <div className="mt-1 text-xs text-red-400">{cloudSaveError}</div>
+                )}
+              </div>
+            )}
+            </>
           )}
 
           <section className="rounded border border-white/10 bg-[#1d1e21] p-3">
@@ -2594,200 +2835,370 @@ export default function SolvePage() {
         </aside>
       </div>
 
-      {DEV_SOLVE_FIXTURES_ENABLED && devFixturesOpen && (
-        <Modal title="Load dev fixture" onClose={() => setDevFixturesOpen(false)}>
-          <div className="space-y-3">
-            <div>
-              <h3 className="text-sm font-semibold">Pre-solved development spots</h3>
-              <p className="mt-1 text-xs text-zinc-500">
-                These JSON fixtures hydrate the UI instantly. They include root and shallow action-path nodes only.
-              </p>
-            </div>
-            <div className="space-y-2">
-              {devFixtures.map((fixture) => (
+      {DEV_SOLVE_FIXTURES_ENABLED && (
+        <SidebarPopup
+          anchorRef={devFixturesPopup.anchorRef}
+          closing={devFixturesPopup.closing}
+          onClose={devFixturesPopup.closePopup}
+          onClosed={devFixturesPopup.finishClose}
+          open={devFixturesPopup.open}
+          subtitle="Pre-solved development spots with root and shallow action-path nodes."
+          title="Load dev fixture"
+        >
+          <div className="space-y-2">
+            {devFixtures.map((fixture) => (
+              <button
+                className="block w-full rounded border border-white/10 bg-[#222326] p-3 text-left hover:border-amber-200/60 hover:bg-[#2a2923]"
+                key={fixture.id}
+                onClick={() => loadDevFixture(fixture)}
+                type="button"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-zinc-100">{fixture.label}</div>
+                    <div className="mt-1 text-xs text-zinc-500">{fixture.description}</div>
+                  </div>
+                  <span className="shrink-0 rounded bg-black/20 px-2 py-1 text-[10px] text-zinc-400">
+                    {fixture.nodes.length} nodes
+                  </span>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-zinc-500">
+                  <span className="rounded bg-black/20 px-2 py-1">{fixture.boardSlots.join(" ")}</span>
+                  <span className="rounded bg-black/20 px-2 py-1">{fixture.maxIterations} iterations</span>
+                  <span className="rounded bg-black/20 px-2 py-1">
+                    Expl {formatExploitability(fixture.progress.exploitability, 2)}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </SidebarPopup>
+      )}
+
+      {boardPickerPopup.open && activeBoardSlot !== null && (
+        <FadePopup
+          anchorRef={boardPickerPopup.anchorRef}
+          closing={boardPickerPopup.closing}
+          onClose={closeBoardPicker}
+          onClosed={finishBoardPickerClose}
+        >
+          <div className="p-4">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold">Choose card</div>
+                <div className="text-xs text-zinc-500">
+                  Flop card {activeBoardSlot + 1}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {boardSlots[activeBoardSlot] && (
+                  <button
+                    className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
+                    onClick={() => clearBoardSlot(activeBoardSlot)}
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                )}
                 <button
-                  className="block w-full rounded border border-white/10 bg-[#222326] p-3 text-left hover:border-amber-200/60 hover:bg-[#2a2923]"
-                  key={fixture.id}
-                  onClick={() => loadDevFixture(fixture)}
+                  className="rounded bg-white/8 px-2 py-1 text-xs text-zinc-300 hover:bg-white/12"
+                  onClick={closeBoardPicker}
                   type="button"
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold text-zinc-100">{fixture.label}</div>
-                      <div className="mt-1 text-xs text-zinc-500">{fixture.description}</div>
-                    </div>
-                    <span className="shrink-0 rounded bg-black/20 px-2 py-1 text-[10px] text-zinc-400">
-                      {fixture.nodes.length} nodes
-                    </span>
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-zinc-500">
-                    <span className="rounded bg-black/20 px-2 py-1">{fixture.boardSlots.join(" ")}</span>
-                    <span className="rounded bg-black/20 px-2 py-1">{fixture.maxIterations} iterations</span>
-                    <span className="rounded bg-black/20 px-2 py-1">
-                      Expl {fixture.progress.exploitability.toFixed(2)}
-                    </span>
-                  </div>
+                  Close
                 </button>
-              ))}
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      {spotPresetOpen && (
-        <Modal title="Configure spot preset" onClose={() => setSpotPresetOpen(false)}>
-          <div className="space-y-4">
-            <div>
-              <h3 className="text-sm font-semibold">Preset Inputs</h3>
-              <p className="mt-1 text-xs text-zinc-500">
-                These choices determine the heuristic OOP and IP ranges sent to the solver.
-              </p>
-            </div>
-            <label className="block">
-              <span className="mb-1 block text-xs text-zinc-500">Game type</span>
-              <select
-                className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                onChange={(event) => {
-                  const nextGameType = event.target.value as GameType;
-                  const nextPositions: readonly string[] = POSITIONS_BY_GAME[nextGameType];
-                  const nextHeroPosition = nextPositions.includes(heroPosition) ? heroPosition : nextPositions[0];
-                  const nextVillainPosition =
-                    nextPositions.includes(villainPosition) && villainPosition !== nextHeroPosition
-                      ? villainPosition
-                      : nextPositions.find((position) => position !== nextHeroPosition) ?? nextPositions[0];
-
-                  applySpotPreset(nextGameType, nextHeroPosition, nextVillainPosition, potType);
-                }}
-                value={gameType}
-              >
-                {GAME_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {type}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="grid grid-cols-2 gap-3">
-              <label className="block">
-                <span className="mb-1 block text-xs text-zinc-500">Hero</span>
-                <select
-                  className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                  onChange={(event) => {
-                    const nextHeroPosition = event.target.value;
-                    const nextVillainPosition =
-                      nextHeroPosition === villainPosition
-                        ? availablePositions.find((position) => position !== nextHeroPosition) ?? villainPosition
-                        : villainPosition;
-
-                    applySpotPreset(gameType, nextHeroPosition, nextVillainPosition, potType);
-                  }}
-                  value={heroPosition}
-                >
-                  {availablePositions.map((position) => (
-                    <option disabled={position === villainPosition} key={position} value={position}>
-                      {position}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs text-zinc-500">Villain</span>
-                <select
-                  className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                  onChange={(event) => {
-                    applySpotPreset(gameType, heroPosition, event.target.value, potType);
-                  }}
-                  value={villainPosition}
-                >
-                  {availablePositions.map((position) => (
-                    <option disabled={position === heroPosition} key={position} value={position}>
-                      {position}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            <label className="block">
-              <span className="mb-1 block text-xs text-zinc-500">Pot type</span>
-              <select
-                className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                onChange={(event) => {
-                  applySpotPreset(gameType, heroPosition, villainPosition, event.target.value as PotType);
-                }}
-                value={potType}
-              >
-                {POT_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {type}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="rounded border border-white/10 bg-[#222326] p-3 text-sm">
-              <div className="mb-1 text-xs text-zinc-500">Solver ranges</div>
-              <div className="font-semibold">
-                OOP {oopPosition} <span className="px-1 text-zinc-600">/</span> IP {ipPosition}
               </div>
             </div>
-            <div className="flex justify-end">
-              <button
-                className="rounded bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200"
-                onClick={() => setSpotPresetOpen(false)}
-                type="button"
-              >
-                Done
-              </button>
+            <div className="space-y-3">
+              <div>
+                <div className="mb-1.5 text-xs font-medium text-zinc-500">Rank</div>
+                <div className="grid grid-cols-7 gap-1.5">
+                  {CARD_PICKER_RANKS.split("").map((rank) => (
+                    <button
+                      className={
+                        activeCardRank === rank
+                          ? "rounded bg-sky-300 px-2 py-2 text-sm font-semibold text-black"
+                          : "rounded bg-[#26272a] px-2 py-2 text-sm font-semibold text-zinc-100 hover:bg-[#33353a]"
+                      }
+                      key={rank}
+                      onClick={() => setActiveCardRank(rank)}
+                      type="button"
+                    >
+                      {rank}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <span className="text-xs font-medium text-zinc-500">Suit</span>
+                  <span className="text-xs text-zinc-600">Pick {activeCardRank} suit</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {CARD_PICKER_SUITS.split("").map((suit) => {
+                    const card = `${activeCardRank}${suit}`;
+                    const selectedInOtherSlot =
+                      selectedBoardCards.has(card) && boardSlots[activeBoardSlot] !== card;
+
+                    return (
+                      <PlayingCard
+                        active={boardSlots[activeBoardSlot] === card}
+                        card={card}
+                        className="w-full"
+                        disabled={selectedInOtherSlot}
+                        key={suit}
+                        onClick={() => selectBoardCard(card)}
+                        tone="sky"
+                      />
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </div>
-        </Modal>
+        </FadePopup>
       )}
 
-      {solveSettingsOpen && (
-        <Modal title="Solve settings" onClose={() => setSolveSettingsOpen(false)}>
-          <div className="space-y-4">
-            <div>
-              <h3 className="text-sm font-semibold">Run Controls</h3>
-              <p className="mt-1 text-xs text-zinc-500">
-                Tune solver runtime and convergence target before starting a solve.
-              </p>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <label className="block">
-                <span className="mb-1 block text-xs text-zinc-500">Iterations</span>
-                <input
-                  className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                  type="number"
-                  value={maxIterations}
-                  onChange={(event) => setMaxIterations(Number(event.target.value))}
-                />
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs text-zinc-500">Target % pot</span>
-                <input
-                  className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
-                  type="number"
-                  step="0.1"
-                  value={targetExpl}
-                  onChange={(event) => setTargetExpl(Number(event.target.value))}
-                />
-              </label>
-            </div>
-            <div className="flex justify-end">
-              <button
-                className="rounded bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200"
-                onClick={() => setSolveSettingsOpen(false)}
-                type="button"
+      <SidebarPopup
+        anchorRef={spotPresetPopup.anchorRef}
+        closing={spotPresetPopup.closing}
+        onClose={spotPresetPopup.closePopup}
+        onClosed={spotPresetPopup.finishClose}
+        open={spotPresetPopup.open}
+        subtitle="These choices determine the heuristic OOP and IP ranges sent to the solver."
+        title="Configure spot preset"
+      >
+        <div className="space-y-4">
+          <label className="block">
+            <span className="mb-1 block text-xs text-zinc-500">Game type</span>
+            <select
+              className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+              onChange={(event) => {
+                const nextGameType = event.target.value as GameType;
+                const nextPositions: readonly string[] = POSITIONS_BY_GAME[nextGameType];
+                const nextHeroPosition = nextPositions.includes(heroPosition) ? heroPosition : nextPositions[0];
+                const nextVillainPosition =
+                  nextPositions.includes(villainPosition) && villainPosition !== nextHeroPosition
+                    ? villainPosition
+                    : nextPositions.find((position) => position !== nextHeroPosition) ?? nextPositions[0];
+
+                applySpotPreset(nextGameType, nextHeroPosition, nextVillainPosition, potType);
+              }}
+              value={gameType}
+            >
+              {GAME_TYPES.map((type) => (
+                <option key={type} value={type}>
+                  {type}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="mb-1 block text-xs text-zinc-500">Hero</span>
+              <select
+                className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+                onChange={(event) => {
+                  const nextHeroPosition = event.target.value;
+                  const nextVillainPosition =
+                    nextHeroPosition === villainPosition
+                      ? availablePositions.find((position) => position !== nextHeroPosition) ?? villainPosition
+                      : villainPosition;
+
+                  applySpotPreset(gameType, nextHeroPosition, nextVillainPosition, potType);
+                }}
+                value={heroPosition}
               >
-                Done
-              </button>
+                {availablePositions.map((position) => (
+                  <option disabled={position === villainPosition} key={position} value={position}>
+                    {position}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs text-zinc-500">Villain</span>
+              <select
+                className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+                onChange={(event) => {
+                  applySpotPreset(gameType, heroPosition, event.target.value, potType);
+                }}
+                value={villainPosition}
+              >
+                {availablePositions.map((position) => (
+                  <option disabled={position === heroPosition} key={position} value={position}>
+                    {position}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <label className="block">
+            <span className="mb-1 block text-xs text-zinc-500">Pot type</span>
+            <select
+              className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+              onChange={(event) => {
+                applySpotPreset(gameType, heroPosition, villainPosition, event.target.value as PotType);
+              }}
+              value={potType}
+            >
+              {POT_TYPES.map((type) => (
+                <option key={type} value={type}>
+                  {type}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="rounded border border-white/10 bg-[#222326] p-3 text-sm">
+            <div className="mb-1 text-xs text-zinc-500">Solver ranges</div>
+            <div className="font-semibold">
+              OOP {oopPosition} <span className="px-1 text-zinc-600">/</span> IP {ipPosition}
             </div>
           </div>
-        </Modal>
-      )}
+        </div>
+      </SidebarPopup>
 
-      {advancedOpen && (
-        <Modal title="Advanced settings" onClose={() => setAdvancedOpen(false)}>
-          <div className="space-y-4">
+      <SidebarPopup
+        anchorRef={betSizingPopup.anchorRef}
+        closing={betSizingPopup.closing}
+        onClose={betSizingPopup.closePopup}
+        onClosed={betSizingPopup.finishClose}
+        open={betSizingPopup.open}
+        subtitle="Choose a solve preset"
+        title="Bet sizing"
+      >
+        <div className="grid grid-cols-2 gap-2">
+          {(Object.keys(TREE_PRESETS) as TreePreset[]).map((preset) => {
+            const active = treePreset === preset && actionConfigMatchesPreset;
+
+            return (
+              <button
+                className={
+                  active
+                    ? "rounded border border-sky-300/60 bg-sky-300 px-3 py-3 text-left"
+                    : "rounded border border-white/10 bg-[#242528] px-3 py-3 text-left hover:border-sky-300/50 hover:bg-[#22313a]"
+                }
+                key={preset}
+                onClick={() => selectTreePreset(preset)}
+                type="button"
+              >
+                <div className={active ? "text-sm font-semibold text-black" : "text-sm font-semibold text-zinc-200"}>
+                  {TREE_PRESETS[preset].label}
+                </div>
+                <div className={active ? "mt-1 text-[11px] text-black/70" : "mt-1 text-[11px] text-zinc-500"}>
+                  Bets {TREE_PRESETS[preset].bets} · Raises {TREE_PRESETS[preset].raises}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-3 text-xs leading-relaxed text-zinc-500">{activePresetMeta.description}</p>
+        {treeSizeWarning && (
+          <div className="mt-2 rounded border border-amber-300/30 bg-amber-300/10 p-2 text-xs text-amber-100">
+            This tree has many bet and raise options and may require more memory or solve time.
+          </div>
+        )}
+        {!actionConfigIsDefault && (
+          <p className="mt-2 text-xs text-amber-100">
+            Custom bet sizes are active. Use Advanced settings to edit individual streets or reset to Simple Solve.
+          </p>
+        )}
+      </SidebarPopup>
+
+      <SidebarPopup
+        anchorRef={solveSettingsPopup.anchorRef}
+        closing={solveSettingsPopup.closing}
+        onClose={solveSettingsPopup.closePopup}
+        onClosed={solveSettingsPopup.finishClose}
+        open={solveSettingsPopup.open}
+        subtitle="Tune solver runtime and convergence target before starting a solve."
+        title="Solve settings"
+      >
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="mb-1 block text-xs text-zinc-500">Iterations</span>
+            <input
+              className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+              type="number"
+              value={maxIterations}
+              onChange={(event) => setMaxIterations(Number(event.target.value))}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-zinc-500">Target % pot</span>
+            <input
+              className="h-10 w-full rounded border border-white/10 bg-[#222326] px-3 text-sm outline-none focus:border-sky-300/70"
+              type="number"
+              step="0.1"
+              value={targetExpl}
+              onChange={(event) => setTargetExpl(Number(event.target.value))}
+            />
+	      </label>
+	    </div>
+        <div className="mt-4">
+          <div className="mb-2 text-xs text-zinc-500">Storage mode</div>
+          <div className="grid grid-cols-3 gap-2">
+            {STORAGE_MODE_OPTIONS.map((option) => {
+              const active = storageMode === option.mode;
+              return (
+                <button
+                  className={
+                    active
+                      ? "rounded border border-sky-300/60 bg-sky-300 px-2 py-2 text-left text-black"
+                      : "rounded border border-white/10 bg-[#222326] px-2 py-2 text-left text-zinc-300 hover:border-sky-300/50"
+                  }
+                  key={option.mode}
+                  onClick={() => setStorageMode(option.mode)}
+                  type="button"
+                >
+                  <div className="text-xs font-semibold">{option.label}</div>
+                  <div className={active ? "mt-1 text-[10px] leading-snug text-black/70" : "mt-1 text-[10px] leading-snug text-zinc-500"}>
+                    {option.note}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="mt-4">
+          <div className="mb-2 text-xs text-zinc-500">Progress accuracy</div>
+          <div className="grid grid-cols-3 gap-2">
+            {(Object.keys(PROGRESS_MODES) as ProgressMode[]).map((mode) => {
+              const option = PROGRESS_MODES[mode];
+              const active = progressMode === mode;
+              return (
+                <button
+                  className={
+                    active
+                      ? "rounded border border-sky-300/60 bg-sky-300 px-2 py-2 text-left text-black"
+                      : "rounded border border-white/10 bg-[#222326] px-2 py-2 text-left text-zinc-300 hover:border-sky-300/50"
+                  }
+                  key={mode}
+                  onClick={() => setProgressMode(mode)}
+                  type="button"
+                >
+                  <div className="text-xs font-semibold">{option.label}</div>
+                  <div className={active ? "mt-1 text-[10px] leading-snug text-black/70" : "mt-1 text-[10px] leading-snug text-zinc-500"}>
+                    {option.note}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </SidebarPopup>
+
+      <SidebarPopup
+        anchorRef={advancedPopup.anchorRef}
+        closing={advancedPopup.closing}
+        onClose={advancedPopup.closePopup}
+        onClosed={advancedPopup.finishClose}
+        open={advancedPopup.open}
+        panelWidth={POPUP_PANEL_WIDTH_WIDE}
+        subtitle="Ranges, full tree, rake, and generated payload"
+        title="Advanced settings"
+      >
+        <div className="space-y-4">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h3 className="text-sm font-semibold">Ranges</h3>
@@ -2916,15 +3327,14 @@ export default function SolvePage() {
               </button>
               <button
                 className="rounded bg-sky-300 px-4 py-2 text-sm font-semibold text-black hover:bg-sky-200"
-                onClick={() => setAdvancedOpen(false)}
+                onClick={advancedPopup.closePopup}
                 type="button"
               >
                 Apply
               </button>
             </div>
-          </div>
-        </Modal>
-      )}
+        </div>
+      </SidebarPopup>
 
       {nodeOpen && (
         <Modal title="Current node" onClose={() => setNodeOpen(false)}>

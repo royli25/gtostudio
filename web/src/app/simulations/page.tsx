@@ -2,8 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
-import devSolves from "../solve/dev-fixtures/solves.json";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   actionAmount,
   actionPutsMoneyIn,
@@ -17,6 +16,8 @@ import {
   type ComboRow,
   type SolveResults,
 } from "@/lib/poker";
+import { listSolvedSpots, type SolvedSpot } from "@/lib/solved-spots";
+import { downloadTree } from "@/lib/tree-storage";
 
 type PracticeFixture = {
   boardSlots: string[];
@@ -46,12 +47,18 @@ type Seat = {
   name: string;
   position: string;
   stack: string;
-  status: "hero" | "villain";
+  status: "hero" | "villain" | "inactive";
   x: string;
   y: string;
 };
 
-const FIXTURES = devSolves as PracticeFixture[];
+type LoadingState =
+  | { status: "loading" }
+  | { status: "picking"; spots: SolvedSpot[] }
+  | { status: "downloading"; spot: SolvedSpot }
+  | { status: "ready"; fixture: PracticeFixture }
+  | { status: "error"; message: string };
+
 const HERO_SOLVER_ROLE = "oop";
 const TABLE_ASPECT = 1.55;
 const TABLE_WIDTH_PX = 896;
@@ -61,12 +68,91 @@ const HOLE_CARD_HEIGHT_PX = 80;
 const SEAT_TAB_HEIGHT_PX = Math.round(HOLE_CARD_HEIGHT_PX * 0.8);
 const OPPONENT_ACTING_MS = 700;
 
+const POSITIONS_BY_GAME: Record<string, readonly string[]> = {
+  "Heads-up": ["SB", "BB"],
+  "6-max": ["SB", "BB", "UTG", "HJ", "CO", "BTN"],
+  "9-max": ["SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO", "BTN"],
+};
+
+const SEAT_COORDS: Record<number, ReadonlyArray<{ x: string; y: string }>> = {
+  2: [
+    { x: "50%", y: "89%" },
+    { x: "50%", y: "11%" },
+  ],
+  6: [
+    { x: "50%", y: "89%" },
+    { x: "87%", y: "72%" },
+    { x: "87%", y: "28%" },
+    { x: "50%", y: "11%" },
+    { x: "13%", y: "28%" },
+    { x: "13%", y: "72%" },
+  ],
+  9: [
+    { x: "50%", y: "89%" },
+    { x: "82%", y: "80%" },
+    { x: "95%", y: "50%" },
+    { x: "82%", y: "20%" },
+    { x: "50%", y: "11%" },
+    { x: "18%", y: "20%" },
+    { x: "5%", y: "50%" },
+    { x: "18%", y: "80%" },
+    { x: "50%", y: "100%" },
+  ],
+};
+
+function buildAllSeats(
+  gameType: string,
+  heroPosition: string,
+  villainPosition: string,
+  effectiveStack: number,
+  heroCards?: [string, string],
+): Seat[] {
+  const positions = POSITIONS_BY_GAME[gameType] ?? POSITIONS_BY_GAME["6-max"];
+  const numSeats = positions.length;
+  const coords = SEAT_COORDS[numSeats] ?? SEAT_COORDS[6];
+
+  const heroIdx = positions.indexOf(heroPosition);
+  if (heroIdx === -1) return [];
+
+  return coords.map((coord, seatIndex) => {
+    const posIdx = (heroIdx + seatIndex) % numSeats;
+    const position = positions[posIdx];
+    const isHero = position === heroPosition;
+    const isVillain = position === villainPosition;
+
+    return {
+      x: coord.x,
+      y: coord.y,
+      position,
+      name: isHero ? "Hero" : isVillain ? "Villain" : position,
+      stack: formatMoney(effectiveStack),
+      status: isHero ? ("hero" as const) : isVillain ? ("villain" as const) : ("inactive" as const),
+      cards: isHero ? heroCards : undefined,
+    };
+  });
+}
+
 function cardAsset(card: string): string {
   if (card === "back") return "/PokerCards/cardback.svg";
 
   const rank = card.slice(0, -1).replace("T", "10").toUpperCase();
   const suit = card.slice(-1).toUpperCase();
   return `/PokerCards/${rank}${suit}.svg`;
+}
+
+function spotToFixture(spot: SolvedSpot, nodes: SolveResults[]): PracticeFixture {
+  return {
+    id: spot.id,
+    label: `${spot.oopPosition} vs ${spot.ipPosition} – ${spot.board}`,
+    gameType: spot.gameType,
+    potType: spot.potType,
+    heroPosition: spot.oopPosition,
+    villainPosition: spot.ipPosition,
+    startingPot: spot.startingPot,
+    effectiveStack: spot.effectiveStack,
+    boardSlots: spot.board.trim().split(/\s+/),
+    nodes: nodes.map((n) => ({ history: n.history, result: n })),
+  };
 }
 
 function buildQuestions(fixtures: PracticeFixture[]): PracticeQuestion[] {
@@ -176,17 +262,31 @@ function HoleCards({ cards }: { cards?: [string, string] }) {
 
 function SeatInfoPlate({
   acting,
+  inactive = false,
   position,
   stack,
   hero = false,
   placement,
 }: {
   acting?: boolean;
+  inactive?: boolean;
   position: string;
   stack: string;
   hero?: boolean;
   placement: "left" | "right";
 }) {
+  if (inactive) {
+    return (
+      <div
+        className="flex min-w-[5.5rem] shrink-0 flex-col items-center justify-center rounded-2xl border-2 border-zinc-700/40 bg-[#1a1b1e] px-3 py-1 shadow-[0_3px_10px_rgba(0,0,0,0.4)]"
+        style={{ height: SEAT_TAB_HEIGHT_PX }}
+      >
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-600">{position}</div>
+        <div className="text-[13px] font-bold leading-tight text-zinc-500">{stack}</div>
+      </div>
+    );
+  }
+
   const edgeClass =
     placement === "right"
       ? "-ml-5 rounded-l-none rounded-r-2xl border-l-0 pl-7 pr-3"
@@ -217,9 +317,27 @@ function SeatInfoPlate({
 }
 
 function Seat({ acting = false, seat }: { acting?: boolean; seat: Seat }) {
+  const isInactive = seat.status === "inactive";
   const pct = parseFloat(seat.x);
   const rightSide = pct >= 60;
   const center = pct > 40 && pct < 60;
+
+  if (isInactive) {
+    return (
+      <div
+        className="absolute z-10 -translate-x-1/2 -translate-y-1/2"
+        style={{ left: seat.x, top: seat.y }}
+      >
+        <SeatInfoPlate
+          inactive
+          placement="left"
+          position={seat.position}
+          stack={seat.stack}
+        />
+      </div>
+    );
+  }
+
   const anchorClass = rightSide
     ? "-translate-x-full -translate-y-1/2"
     : center
@@ -525,8 +643,75 @@ function usePrefersReducedMotion(): boolean {
   return reduced;
 }
 
-export default function SimulationsPage() {
-  const questions = useMemo(() => buildQuestions(FIXTURES), []);
+function SpotPicker({
+  spots,
+  onSelect,
+}: {
+  spots: SolvedSpot[];
+  onSelect: (spot: SolvedSpot) => void;
+}) {
+  return (
+    <main className="grid h-screen place-items-center bg-[#101112] text-zinc-100">
+      <div className="w-full max-w-lg rounded border border-white/10 bg-[#161719] p-6">
+        <h2 className="mb-4 text-lg font-semibold">Select a spot to practice</h2>
+        <div className="space-y-2">
+          {spots.map((spot) => (
+            <button
+              key={spot.id}
+              className="flex w-full items-center justify-between rounded border border-white/10 bg-[#1d1e21] px-4 py-3 text-left text-sm transition hover:border-sky-300/50 hover:bg-[#22313a]"
+              onClick={() => onSelect(spot)}
+              type="button"
+            >
+              <div>
+                <div className="font-semibold text-zinc-100">
+                  {spot.oopPosition} vs {spot.ipPosition} – {spot.board}
+                </div>
+                <div className="mt-0.5 text-xs text-zinc-500">
+                  {spot.gameType} · {spot.potType} · {spot.effectiveStack}bb
+                </div>
+              </div>
+              <span className="shrink-0 rounded bg-emerald-400/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">
+                {spot.iterations} iters
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function FullScreenMessage({ message, sub }: { message: string; sub?: string }) {
+  return (
+    <main className="grid h-screen place-items-center bg-[#101112] text-zinc-100">
+      <div className="rounded border border-white/10 bg-[#161719] p-6 text-center">
+        <div className="text-sm text-zinc-400">{message}</div>
+        {sub && <div className="mt-2 text-xs text-zinc-600">{sub}</div>}
+      </div>
+    </main>
+  );
+}
+
+function ErrorScreen({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <main className="grid h-screen place-items-center bg-[#101112] text-zinc-100">
+      <div className="max-w-md rounded border border-red-500/30 bg-[#1a1214] p-6 text-center">
+        <div className="mb-2 text-sm font-semibold text-red-300">Error</div>
+        <div className="text-sm text-zinc-400">{message}</div>
+        <button
+          className="mt-4 rounded bg-white/8 px-4 py-2 text-sm text-zinc-200 hover:bg-white/12"
+          onClick={onRetry}
+          type="button"
+        >
+          Retry
+        </button>
+      </div>
+    </main>
+  );
+}
+
+function SimulationGame({ fixture }: { fixture: PracticeFixture }) {
+  const questions = useMemo(() => buildQuestions([fixture]), [fixture]);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [selectedAction, setSelectedAction] = useState<number | null>(null);
   const [phase, setPhase] = useState<AnimationPhase>("idle");
@@ -542,11 +727,10 @@ export default function SimulationsPage() {
 
   if (!question) {
     return (
-      <main className="grid h-screen place-items-center bg-[#101112] text-zinc-100">
-        <div className="rounded border border-white/10 bg-[#161719] p-6 text-sm text-zinc-400">
-          No practice fixtures are available.
-        </div>
-      </main>
+      <FullScreenMessage
+        message="No practice hands available for this spot."
+        sub="The solved tree may not contain any OOP decision nodes."
+      />
     );
   }
 
@@ -595,23 +779,13 @@ export default function SimulationsPage() {
   const heroActionAmount = selectedActionAmount(question, selectedAction);
   const visibleBoard = boardCards(question);
   const pot = currentPot(question) + (phase === "review" ? heroActionAmount : 0);
-  const heroSeat: Seat = {
-    cards: [question.combo.cardA, question.combo.cardB],
-    name: "Hero",
-    position: question.fixture.heroPosition,
-    stack: formatMoney(question.fixture.effectiveStack),
-    status: "hero",
-    x: "50%",
-    y: "89%",
-  };
-  const villainSeat: Seat = {
-    name: "Villain",
-    position: question.fixture.villainPosition,
-    stack: formatMoney(question.fixture.effectiveStack),
-    status: "villain",
-    x: "50%",
-    y: "11%",
-  };
+  const allSeats = buildAllSeats(
+    question.fixture.gameType,
+    question.fixture.heroPosition,
+    question.fixture.villainPosition,
+    question.fixture.effectiveStack,
+    [question.combo.cardA, question.combo.cardB],
+  );
 
   return (
     <main className="flex h-screen flex-col overflow-hidden bg-[#101112] text-zinc-100">
@@ -695,8 +869,13 @@ export default function SimulationsPage() {
                 <ChipStack amount={formatMoney(heroActionAmount)} className="bottom-[32%] left-1/2 -translate-x-1/2" />
               )}
 
-              <Seat seat={villainSeat} acting={phase === "opponentActing"} />
-              <Seat seat={heroSeat} />
+              {allSeats.map((seat) => (
+                <Seat
+                  key={seat.position}
+                  acting={seat.status === "villain" && phase === "opponentActing"}
+                  seat={seat}
+                />
+              ))}
 
               {selectedActionLabel && (
                 <div className="absolute bottom-[18%] left-1/2 z-30 -translate-x-1/2 rounded bg-sky-300 px-3 py-1 text-xs font-bold text-black shadow-lg">
@@ -717,4 +896,70 @@ export default function SimulationsPage() {
       </div>
     </main>
   );
+}
+
+export default function SimulationsPage() {
+  const [state, setState] = useState<LoadingState>({ status: "loading" });
+
+  const loadSpots = useCallback(async () => {
+    setState({ status: "loading" });
+    try {
+      const spots = await listSolvedSpots();
+      const withTrees = spots.filter((s) => s.treePath);
+      if (withTrees.length === 0) {
+        setState({
+          status: "error",
+          message: "No solved spots found. Go to the Study page, solve a spot, and upload the tree first.",
+        });
+        return;
+      }
+      if (withTrees.length === 1) {
+        // Auto-select the only spot
+        selectSpot(withTrees[0]);
+        return;
+      }
+      setState({ status: "picking", spots: withTrees });
+    } catch (err) {
+      setState({
+        status: "error",
+        message: `Failed to load spots from cloud: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }, []);
+
+  const selectSpot = async (spot: SolvedSpot) => {
+    setState({ status: "downloading", spot });
+    try {
+      const nodes = await downloadTree(spot.id);
+      const fixture = spotToFixture(spot, nodes);
+      setState({ status: "ready", fixture });
+    } catch (err) {
+      setState({
+        status: "error",
+        message: `Failed to download tree for "${spot.board}": ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  };
+
+  useEffect(() => {
+    loadSpots();
+  }, [loadSpots]);
+
+  switch (state.status) {
+    case "loading":
+      return <FullScreenMessage message="Loading solved spots from cloud..." />;
+    case "picking":
+      return <SpotPicker spots={state.spots} onSelect={selectSpot} />;
+    case "downloading":
+      return (
+        <FullScreenMessage
+          message={`Downloading tree for ${state.spot.board}...`}
+          sub="This may take a few seconds depending on tree size."
+        />
+      );
+    case "error":
+      return <ErrorScreen message={state.message} onRetry={loadSpots} />;
+    case "ready":
+      return <SimulationGame fixture={state.fixture} />;
+  }
 }

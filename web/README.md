@@ -16,6 +16,30 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Supabase
+
+Create `web/.env.local` from `web/.env.example` and fill in your Supabase project values:
+
+```bash
+cp .env.example .env.local
+```
+
+Required values:
+
+```bash
+NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+```
+
+`NEXT_PUBLIC_SUPABASE_*` values are safe for browser use. `SUPABASE_SERVICE_ROLE_KEY` is server-only and must never be imported into client components.
+
+To create the starter solution metadata table, run `web/supabase/schema.sql` in the Supabase SQL editor. After setting env vars and starting the app, check the connection at:
+
+```txt
+http://localhost:3000/api/supabase/health
+```
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
