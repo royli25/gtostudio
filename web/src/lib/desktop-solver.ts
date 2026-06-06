@@ -48,10 +48,41 @@ export interface SolveDone {
   exploitability: number;
 }
 
+export type SolverPhase =
+  | { type: "idle" }
+  | { type: "solving"; iteration: number; maxIterations: number; exploitability: number | null }
+  | { type: "extracting" }
+  | { type: "uploading" }
+  | { type: "done"; exploitability: number; spotId: string | null }
+  | { type: "error"; phase: string; message: string };
+
 export interface SolverStatus {
+  phase: SolverPhase;
   initialized: boolean;
-  solving: boolean;
-  lastResult: SolveDone | null;
+}
+
+export interface SolverStartConfig {
+  maxIterations: number;
+  targetExploitability: number;
+  exploitabilityInterval: number;
+  supabaseUrl?: string;
+  supabaseAnonKey?: string;
+  spotMetadata?: Record<string, unknown>;
+}
+
+export interface SolveConfig {
+  board: string[];
+  oopRange: string;
+  ipRange: string;
+  oopPosition: string;
+  ipPosition: string;
+  gameType: string;
+  potType: string;
+  startingPot: number;
+  effectiveStack: number;
+  treeConfig: Record<string, unknown>;
+  maxIterations: number;
+  targetExploitability: number;
 }
 
 export interface LocalSolveMetadata {
@@ -80,6 +111,10 @@ interface SolverEventHandlers {
   onLog?: (message: string) => void;
   onMemoryAllocated?: () => void;
   onProgress?: (progress: ProgressPoint) => void;
+  onExtracting?: () => void;
+  onUploading?: () => void;
+  onDone?: (result: { exploitability: number; spotId: string | null }) => void;
+  onSolverError?: (error: { phase: string; message: string }) => void;
 }
 
 interface SolverLogPayload {
@@ -104,6 +139,20 @@ export class DesktopSolverClient {
       }),
       listen<SolverLogPayload>("solver_error", (event) => {
         handlers.onError?.(event.payload.message ?? "Unknown solver error");
+      }),
+      listen("solver_extracting", () => {
+        handlers.onExtracting?.();
+      }),
+      listen("solver_uploading", () => {
+        handlers.onUploading?.();
+      }),
+      listen<{ exploitability: number; spotId: string | null }>("solver_done", (event) => {
+        handlers.onDone?.(event.payload);
+      }),
+      listen<{ phase: string; message: string }>("solver_error", (event) => {
+        if (event.payload.phase) {
+          handlers.onSolverError?.(event.payload);
+        }
       }),
     ]);
   }
@@ -154,6 +203,18 @@ export class DesktopSolverClient {
 
   async extractTree(): Promise<SolveResults[]> {
     return invoke<SolveResults[]>("solver_extract_tree");
+  }
+
+  async start(config: SolverStartConfig): Promise<{ started: boolean }> {
+    return invoke<{ started: boolean }>("solver_start", { config });
+  }
+
+  async setConfig(config: SolveConfig): Promise<void> {
+    await invoke("solver_set_config", { config });
+  }
+
+  async getConfig(): Promise<SolveConfig | null> {
+    return invoke<SolveConfig | null>("solver_get_config");
   }
 
   async status(): Promise<SolverStatus> {
