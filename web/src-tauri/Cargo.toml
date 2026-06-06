@@ -17,7 +17,16 @@ path = "src/main.rs"
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
-postflop-solver = { path = "../../engine", default-features = false, features = ["rayon"] }
+postflop-solver = { path = "../../engine", default-features = false, features = ["rayon", "custom-alloc"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.9.5", features = [] }
+
+# Optimize the engine even in dev builds (solves are CPU-bound f32 math)
+[profile.dev.package.postflop-solver]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
