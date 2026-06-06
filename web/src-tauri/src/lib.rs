@@ -1,3 +1,4 @@
+mod cloud;
 mod solver;
 
 use solver::SolverState;
@@ -10,12 +11,14 @@ pub fn run() {
             solver::solver_cancel,
             solver::solver_extract_tree,
             solver::solver_game_info,
+            solver::solver_get_config,
             solver::solver_get_results,
             solver::solver_init,
             solver::solver_list_local_metadata,
             solver::solver_lock_current_node,
             solver::solver_save_local_metadata,
-            solver::solver_solve,
+            solver::solver_set_config,
+            solver::solver_start,
             solver::solver_status,
             solver::solver_unlock_current_node,
         ])
