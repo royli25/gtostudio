@@ -232,3 +232,160 @@ This means the Solve page is fully resumable — navigate away, close the tab, c
 - Progress bar visible on simulations page while solve runs on another spot
 - Zero frontend orchestration code for solve → extract → upload pipeline
 - Cloud save never fails due to navigation
+- Solve speed improved 10-20x from build/compiler optimizations alone
+
+---
+
+## Solver Performance Audit
+
+Full audit of `web/src-tauri/src/solver.rs` and `engine/src/solver.rs` on M1 MacBook Air (10 cores: 4 perf + 6 efficiency).
+
+### Finding 1: No Release-Mode Optimizations (CRITICAL — 5-10x)
+
+The Tauri dev build runs `cargo run` with `dev` profile — **unoptimized + debuginfo**. There are no `[profile.dev]` or `[profile.release]` overrides anywhere. The engine is CPU-bound f32 math (regret matching, inner products, CFV computation) — running unoptimized is easily 5-10x slower than release.
+
+**Current state:** No profile overrides in `web/src-tauri/Cargo.toml`.
+
+**Fix:** Add optimized dev profile for the engine crate and a tuned release profile:
+```toml
+# Optimize the engine even in dev builds (solves are CPU-bound)
+[profile.dev.package.postflop-solver]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+```
+
+This gives release-grade engine performance even during `npm run tauri dev`, while keeping the Tauri shell itself fast to compile in debug mode.
+
+### Finding 2: No Native CPU Target (SIGNIFICANT — 1.5-2x)
+
+No `RUSTFLAGS="-C target-cpu=native"` configured anywhere. On M1 (Apple Silicon), this means the compiler can't use NEON SIMD instructions for the hot f32 slice operations in `engine/src/sliceop.rs`. The engine has no explicit ARM SIMD — it relies on LLVM auto-vectorization, which only works well with `target-cpu=native`.
+
+**Current state:** No `.cargo/config.toml` exists in `web/src-tauri/`.
+
+**Fix:** Create `web/src-tauri/.cargo/config.toml`:
+```toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+Note: This makes the binary non-portable (M1-only). For distribution, build without this flag or use `target-cpu=apple-m1` explicitly.
+
+### Finding 3: Per-Iteration Event Emission Overhead (MODERATE — 1.1-1.3x)
+
+In `solver_solve_blocking`, every single iteration emits a `solver_progress` Tauri event:
+```rust
+// This runs on EVERY iteration — serialization + IPC overhead
+app.emit("solver_progress", ProgressEvent { ... })
+```
+
+The engine's own `solve()` function only computes exploitability every 10 iterations. Our wrapper emits on every iteration AND does string formatting inside `emit_log()` on the hot path during exploitability checks.
+
+**Fix:**
+- Only emit progress events every N iterations (e.g., every 10 or on exploitability intervals)
+- Remove `emit_log()` from inside the solve loop — it allocates a String on every exploitability check
+- Batch iteration count in the event instead of per-iteration emission
+
+### Finding 4: Root Values Recomputed on Every `get_results` Call (MODERATE)
+
+Every call to `solver_get_results` traverses to root and computes:
+```rust
+game.back_to_root();
+let (root_ev_oop, root_eq_oop) = root_values(game, 0);  // full tree traversal
+let (root_ev_ip, root_eq_ip) = root_values(game, 1);    // full tree traversal
+```
+
+Each `root_values()` call does `cache_normalized_weights()` + `expected_values()` + `equity()` + `normalized_weights()` — expensive operations that traverse the strategy data. These values don't change after a solve completes.
+
+**Fix:** Compute root EV/EQ once after `finalize()`, store in `SolverState`:
+```rust
+pub struct SolverState {
+    // ...
+    root_values: Mutex<Option<RootValues>>,
+}
+
+struct RootValues {
+    ev_oop: f32, eq_oop: f32,
+    ev_ip: f32, eq_ip: f32,
+}
+```
+
+### Finding 5: Tree Extraction Replays History From Root for Every Node (SIGNIFICANT)
+
+`solver_extract_tree_blocking` uses a stack-based DFS but calls `apply_history(game, &history)` for every node:
+```rust
+while let Some(history) = stack.pop() {
+    apply_history(game, &history);  // back_to_root() + play() × history.len()
+    // ...
+}
+```
+
+For a tree with 10K nodes at average depth 8, this does ~80K `play()` calls when only ~10K are needed. A proper iterative DFS that advances one step at a time and only backtracks when needed would be much faster.
+
+**Fix:** Refactor to track current position and only advance/backtrack incrementally:
+```rust
+// Instead of replaying full history each time,
+// compute the common prefix with the previous history
+// and only backtrack/advance the difference.
+```
+
+### Finding 6: `available_actions()` Called Twice Per Node (MINOR)
+
+In `solver_get_results`, lines 409 and 418 both call `game.available_actions()`:
+```rust
+let actions = game.available_actions()  // call 1
+    .iter().map(|action| format!("{action:?}")).collect();
+let num_actions = game.available_actions().len();  // call 2 (redundant)
+```
+
+**Fix:** Call once, reuse:
+```rust
+let available = game.available_actions();
+let num_actions = available.len();
+let actions = available.iter().map(|action| format!("{action:?}")).collect();
+```
+
+### Finding 7: `custom-alloc` Feature Not Enabled (MODERATE — 1.2-1.5x)
+
+The engine has a `custom-alloc` feature with `StackAlloc` for temporary vectors in the hot solve loop (regret matching, CFV computation). This avoids heap allocations during tree traversal — significant for deep trees with many nodes.
+
+**Current state in `web/src-tauri/Cargo.toml`:**
+```toml
+postflop-solver = { path = "../../engine", default-features = false, features = ["rayon"] }
+```
+
+**Fix:**
+```toml
+postflop-solver = { path = "../../engine", default-features = false, features = ["rayon", "custom-alloc"] }
+```
+
+### Finding 8: Parallelization Only at Flop/Turn Level (ENGINE DESIGN)
+
+`enable_parallelization()` returns `true` only when `river == NOT_DEALT`:
+```rust
+fn enable_parallelization(&self) -> bool {
+    self.river == NOT_DEALT
+}
+```
+
+This means rayon parallelism only kicks in at flop and turn chance nodes. River subtrees (the bulk of computation for complex trees) run single-threaded on the M1's 10 cores. This is an intentional engine design choice to avoid rayon overhead on small subtrees, but there may be room for more aggressive parallelization on larger trees.
+
+**Status:** Not changing for now — this requires engine-level changes and benchmarking to determine the right threshold. Document for future investigation.
+
+### Performance Implementation Order
+
+| Priority | Fix | Est. Speedup | Effort | Risk |
+|----------|-----|-------------|--------|------|
+| P0 | Release-mode opt for engine | **5-10x** | 2 lines in Cargo.toml | None |
+| P0 | `target-cpu=native` for ARM NEON | **1.5-2x** | 3 lines in config.toml | Non-portable binary |
+| P0 | Enable `custom-alloc` feature | **1.2-1.5x** | 1 line change | None |
+| P1 | Reduce per-iteration event emission | **1.1-1.3x** | ~10 lines | None |
+| P1 | Cache root EV/EQ values | **faster UI** | ~20 lines | None |
+| P1 | Fix DFS replay-from-root extraction | **faster extract** | ~40 lines | Low |
+| P2 | Deduplicate `available_actions()` | **negligible** | 3 lines | None |
+| P2 | Investigate river parallelization | **unknown** | Engine changes | Needs benchmarks |
+
+**Combined P0 items alone: estimated 10-20x speedup.** A 60-second solve becomes 3-6 seconds.
