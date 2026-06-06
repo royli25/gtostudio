@@ -1,7 +1,12 @@
 import type { Metadata } from "next";
 import { DM_Sans, Geist } from "next/font/google";
 import { Agentation } from "agentation";
+import dynamic from "next/dynamic";
 import "./globals.css";
+
+const SolverProgressBar = dynamic(() =>
+  import("@/components/SolverProgressBar").then((m) => m.SolverProgressBar)
+);
 
 const geist = Geist({
   subsets: ["latin"],
@@ -26,6 +31,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full">
       <body className={`${geist.variable} ${dmSans.variable} min-h-full`}>
+        <SolverProgressBar />
         {children}
         {process.env.NODE_ENV === "development" && <Agentation />}
       </body>
